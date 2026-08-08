@@ -17,7 +17,7 @@ final class RuntimeTests: XCTestCase {
 
         let rejected = await runtime.callTool(
             name: "click",
-            arguments: pixelClick(snapshotID: carrier.snapshotID),
+            arguments: Self.pixelClick(snapshotID: carrier.snapshotID),
             context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "action-before-attestation")
         )
         XCTAssertTrue(rejected.isError)
@@ -41,12 +41,12 @@ final class RuntimeTests: XCTestCase {
 
         async let first = runtime.callTool(
             name: "click",
-            arguments: pixelClick(snapshotID: carrier.snapshotID),
+            arguments: Self.pixelClick(snapshotID: carrier.snapshotID),
             context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "action-one")
         )
         async let second = runtime.callTool(
             name: "click",
-            arguments: pixelClick(snapshotID: carrier.snapshotID),
+            arguments: Self.pixelClick(snapshotID: carrier.snapshotID),
             context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "action-two")
         )
         let results = await [first, second]
@@ -71,8 +71,8 @@ final class RuntimeTests: XCTestCase {
         _ = await attest(carrier, runtime: runtime, client: "client-a")
         let context = ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "uncertain-action")
 
-        let first = await runtime.callTool(name: "click", arguments: pixelClick(snapshotID: carrier.snapshotID), context: context)
-        let second = await runtime.callTool(name: "click", arguments: pixelClick(snapshotID: carrier.snapshotID), context: context)
+        let first = await runtime.callTool(name: "click", arguments: Self.pixelClick(snapshotID: carrier.snapshotID), context: context)
+        let second = await runtime.callTool(name: "click", arguments: Self.pixelClick(snapshotID: carrier.snapshotID), context: context)
 
         XCTAssertTrue(first.isError)
         XCTAssertTrue(second.isError)
@@ -184,7 +184,7 @@ final class RuntimeTests: XCTestCase {
         let action = Task {
             await runtime.callTool(
                 name: "click",
-                arguments: pixelClick(snapshotID: carrier.snapshotID),
+                arguments: Self.pixelClick(snapshotID: carrier.snapshotID),
                 context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "suspended-action")
             )
         }
@@ -237,7 +237,7 @@ final class RuntimeTests: XCTestCase {
         )
     }
 
-    private func pixelClick(snapshotID: String) -> [String: JSONValue] {
+    nonisolated private static func pixelClick(snapshotID: String) -> [String: JSONValue] {
         [
             "snapshot_id": .string(snapshotID),
             "target": .object([

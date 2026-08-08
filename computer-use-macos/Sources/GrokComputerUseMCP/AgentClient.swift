@@ -363,9 +363,12 @@ actor AgentClient: ToolCalling {
     }
 
     private static func executableURL(for code: SecCode) throws -> URL {
+        var staticCode: SecStaticCode?
         var rawInformation: CFDictionary?
-        guard SecCodeCopySigningInformation(
-            code,
+        guard SecCodeCopyStaticCode(code, SecCSFlags(rawValue: 0), &staticCode) == errSecSuccess,
+              let staticCode,
+              SecCodeCopySigningInformation(
+            staticCode,
             SecCSFlags(rawValue: kSecCSSigningInformation),
             &rawInformation
         ) == errSecSuccess,
@@ -413,9 +416,12 @@ actor AgentClient: ToolCalling {
         _ code: SecCode,
         executableBasename: String
     ) throws -> ProcessSigningIdentity {
+        var staticCode: SecStaticCode?
         var rawInformation: CFDictionary?
-        guard SecCodeCopySigningInformation(
-            code,
+        guard SecCodeCopyStaticCode(code, SecCSFlags(rawValue: 0), &staticCode) == errSecSuccess,
+              let staticCode,
+              SecCodeCopySigningInformation(
+            staticCode,
             SecCSFlags(rawValue: kSecCSSigningInformation),
             &rawInformation
         ) == errSecSuccess else {

@@ -101,9 +101,12 @@ enum TrustedHostParentVerifier {
         _ code: SecCode,
         executableBasename: String
     ) throws -> ProcessSigningIdentity {
+        var staticCode: SecStaticCode?
         var rawInformation: CFDictionary?
-        guard SecCodeCopySigningInformation(
-            code,
+        guard SecCodeCopyStaticCode(code, SecCSFlags(rawValue: 0), &staticCode) == errSecSuccess,
+              let staticCode,
+              SecCodeCopySigningInformation(
+            staticCode,
             SecCSFlags(rawValue: kSecCSSigningInformation),
             &rawInformation
         ) == errSecSuccess,
@@ -123,7 +126,9 @@ enum TrustedHostParentVerifier {
     }
 
     private static func executableURL(processIdentifier: pid_t) throws -> URL {
-        var buffer = [CChar](repeating: 0, count: Int(PROC_PIDPATHINFO_MAXSIZE))
+        // PROC_PIDPATHINFO_MAXSIZE is a C macro that Swift cannot import.
+        // Its macOS definition is 4 * MAXPATHLEN (4 * 1024).
+        var buffer = [CChar](repeating: 0, count: 4 * 1024)
         guard proc_pidpath(processIdentifier, &buffer, UInt32(buffer.count)) > 0 else {
             throw untrustedParent()
         }

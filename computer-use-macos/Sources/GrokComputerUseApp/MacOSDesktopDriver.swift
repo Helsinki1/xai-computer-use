@@ -5,7 +5,7 @@ import CoreGraphics
 import CryptoKit
 import Foundation
 import ImageIO
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 import UniformTypeIdentifiers
 
 @MainActor
@@ -440,9 +440,12 @@ final class MacOSDesktopDriver: DesktopDriving {
         configuration.scalesToFit = false
         configuration.ignoreShadowsSingleWindow = true
         configuration.showsCursor = false
-        return try await withScreenCaptureDeadline {
-            try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        let captured: UncheckedScreenCaptureValue<CGImage> = try await withScreenCaptureDeadline {
+            UncheckedScreenCaptureValue(value:
+                try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            )
         }
+        return captured.value
     }
 
     private func boundedCanonicalPNG(_ source: CGImage) throws -> (data: Data, width: Int, height: Int) {
@@ -530,12 +533,15 @@ final class MacOSDesktopDriver: DesktopDriving {
         guard CGPreflightScreenCaptureAccess() else {
             throw ComputerUseError.permissionDenied("Screen Recording permission is required for Grok Computer Use.app.")
         }
-        return try await withScreenCaptureDeadline {
-            try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let content: UncheckedScreenCaptureValue<SCShareableContent> = try await withScreenCaptureDeadline {
+            UncheckedScreenCaptureValue(value:
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            )
         }
+        return content.value
     }
 
-    private func withScreenCaptureDeadline<Value>(
+    private func withScreenCaptureDeadline<Value: Sendable>(
         _ operation: @escaping @MainActor () async throws -> Value
     ) async throws -> Value {
         let race = AsyncDeadlineRace<Value>()
@@ -550,7 +556,7 @@ final class MacOSDesktopDriver: DesktopDriving {
                         race.resolve(.failure(error))
                     }
                 }
-                let timerTask = Task.detached {
+                let timerTask = Task { @MainActor in
                     do {
                         try await Task.sleep(for: deadline)
                         race.resolve(.failure(ComputerUseError.stateUnavailable(
@@ -563,7 +569,9 @@ final class MacOSDesktopDriver: DesktopDriving {
                 race.installTasks(operationTask, timerTask)
             }
         } onCancel: {
-            race.resolve(.failure(CancellationError()))
+            Task { @MainActor in
+                race.resolve(.failure(CancellationError()))
+            }
         }
     }
 
@@ -870,38 +878,30 @@ final class MacOSDesktopDriver: DesktopDriving {
     }
 }
 
-private final class AsyncDeadlineRace<Value>: @unchecked Sendable {
-    private let lock = NSLock()
+@MainActor
+private final class AsyncDeadlineRace<Value: Sendable> {
     private var continuation: CheckedContinuation<Value, Error>?
     private var result: Result<Value, Error>?
     private var tasks: [Task<Void, Never>] = []
 
     func install(_ continuation: CheckedContinuation<Value, Error>) {
-        lock.lock()
         if let result {
-            lock.unlock()
             continuation.resume(with: result)
         } else {
             self.continuation = continuation
-            lock.unlock()
         }
     }
 
     func installTasks(_ tasks: Task<Void, Never>...) {
-        lock.lock()
         if result == nil {
             self.tasks = tasks
-            lock.unlock()
         } else {
-            lock.unlock()
             tasks.forEach { $0.cancel() }
         }
     }
 
     func resolve(_ result: Result<Value, Error>) {
-        lock.lock()
         guard self.result == nil else {
-            lock.unlock()
             return
         }
         self.result = result
@@ -909,10 +909,15 @@ private final class AsyncDeadlineRace<Value>: @unchecked Sendable {
         self.continuation = nil
         let tasks = tasks
         self.tasks.removeAll()
-        lock.unlock()
         continuation?.resume(with: result)
         tasks.forEach { $0.cancel() }
     }
+}
+
+// ScreenCaptureKit types are used exclusively on the main actor by this driver,
+// but the SDK does not yet declare them Sendable.
+private struct UncheckedScreenCaptureValue<Value>: @unchecked Sendable {
+    let value: Value
 }
 
 private func copyElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {

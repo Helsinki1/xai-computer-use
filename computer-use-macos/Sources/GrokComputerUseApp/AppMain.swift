@@ -54,8 +54,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func requestPermissionsIfNeeded() {
         if !AXIsProcessTrusted() {
-            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+            // The SDK imports kAXTrustedCheckOptionPrompt as mutable global state,
+            // which Swift 6 will not access from an actor-isolated method.
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         }
         if !CGPreflightScreenCaptureAccess() {
             _ = CGRequestScreenCaptureAccess()

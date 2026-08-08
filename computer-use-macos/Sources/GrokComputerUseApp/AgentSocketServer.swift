@@ -164,13 +164,18 @@ final class AgentSocketServer: @unchecked Sendable {
         guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         do {
             var status = stat()
+            var lock = flock()
+            lock.l_type = Int16(F_WRLCK)
+            lock.l_whence = Int16(SEEK_SET)
+            lock.l_start = 0
+            lock.l_len = 0
             guard fstat(descriptor, &status) == 0,
                   status.st_uid == geteuid(),
                   (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
                   status.st_nlink == 1,
                   fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0,
                   fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0,
-                  Darwin.flock(descriptor, LOCK_EX | LOCK_NB) == 0
+                  fcntl(descriptor, F_SETLK, &lock) == 0
             else {
                 throw ComputerUseError.stateUnavailable("Another Grok Computer Use app instance is active.")
             }

@@ -104,6 +104,10 @@ package enum GrokHostSigningPolicy {
         let identifiers = value.split(separator: ".", omittingEmptySubsequences: false)
         return !identifiers.isEmpty && identifiers.allSatisfy { identifier in
             guard !identifier.isEmpty,
+                  identifier.first?.isASCII == true,
+                  identifier.first?.isLetter == true || identifier.first?.isNumber == true,
+                  identifier.last?.isASCII == true,
+                  identifier.last?.isLetter == true || identifier.last?.isNumber == true,
                   identifier.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") })
             else {
                 return false
