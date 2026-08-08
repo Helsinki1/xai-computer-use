@@ -32,6 +32,7 @@ image = (
         "novnc",
         "openbox",
         "pkg-config",
+        "protobuf-compiler",
         "python3",
         "python3-xdg",
         "websockify",
@@ -72,7 +73,12 @@ def desktop_env() -> dict[str, str]:
     }
 
 
-def wait_for_port(port: int, *, timeout_seconds: float, process: subprocess.Popen[bytes] | None = None) -> None:
+def wait_for_port(
+    port: int,
+    *,
+    timeout_seconds: float,
+    process: subprocess.Popen[bytes] | None = None,
+) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         if process is not None and process.poll() is not None:
