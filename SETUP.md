@@ -1,87 +1,67 @@
 # Local macOS setup
 
 This runs Grok Build in the terminal with the background **Grok Computer Use**
-macOS companion. Local mode supports macOS 14 or newer on Intel and Apple
-Silicon.
+companion. It supports macOS 14 or newer on Intel and Apple Silicon.
 
 ## 1. Install prerequisites
 
-Install:
+Install Xcode Command Line Tools, Rust, and Protocol Buffers (`protoc`).
 
-- Xcode Command Line Tools
-- Rust (the repository selects the required toolchain)
-- Protocol Buffers (`protoc`)
+## 2. Choose a stable signing identity
 
-## 2. Build Grok
-
-From the repository root:
-
-```sh
-PROTOC="$(command -v protoc)" cargo build -p xai-grok-pager-bin
-```
-
-## 3. Install the computer-use companion
-
-For permissions that survive rebuilds, first select a stable Apple Development
-identity from:
+A stable Apple Development identity lets macOS retain Accessibility and Screen
+Recording permissions across rebuilds:
 
 ```sh
 security find-identity -v -p codesigning
-export GROK_COMPUTER_USE_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)"
+export GROK_COMPUTER_USE_CODESIGN_IDENTITY="<Apple Development identity or SHA-1>"
 ```
 
-Use the same exported identity whenever building the companion or launching
-Grok. If no identity is configured, local mode falls back to ad-hoc signing.
+Use the same identity in each terminal where you launch local Grok. Without
+one, the scripts use ad-hoc signing and macOS may require permissions again
+after a rebuild.
+
+## 3. Enable and launch
+
+From the repository root, enable computer use once:
 
 ```sh
-export GROK_COMPUTER_USE_LOCAL_DEV=1
-computer-use-macos/scripts/install-app.sh --build
+computer-use-macos/scripts/run-local.sh computer-use enable
 ```
 
-Grant **Grok Computer Use** access in:
+Then launch Grok Build:
 
-- System Settings → Privacy & Security → Accessibility
-- System Settings → Privacy & Security → Screen Recording
+```sh
+computer-use-macos/scripts/run-local.sh
+```
 
-Restart the companion after granting access:
+`run-local.sh` prompts for `XAI_API_KEY` when it is not already exported. It
+also builds Grok, installs or updates the companion when needed, signs both
+components consistently, and launches the TUI.
+
+Approve **Grok Computer Use** under System Settings → Privacy & Security →
+Accessibility and Screen Recording when macOS requests access. If permissions
+changed while the app was running, restart it and rerun the command:
 
 ```sh
 pkill -x GrokComputerUseApp || true
-open -gj "$HOME/Applications/Grok Computer Use.app"
+open "$HOME/Applications/Grok Computer Use.app"
+computer-use-macos/scripts/run-local.sh --no-rebuild
 ```
 
-The companion runs in the background and does not have a normal app window.
+## Rebuild or reuse the current app
 
-## 4. Enable computer use once
+Force a fresh rebuild and replacement:
 
 ```sh
-computer-use-macos/scripts/run-local-grok.sh computer-use enable
+computer-use-macos/scripts/run-local.sh --rebuild
 ```
 
-This saves the computer-use setting and exits. It does not open the TUI.
-
-## 5. Run Grok Build
+Launch without rebuilding anything:
 
 ```sh
-computer-use-macos/scripts/run-local-grok.sh
+computer-use-macos/scripts/run-local.sh --no-rebuild
 ```
 
-Sign in when prompted. After the one-time enablement, this is the only command
-needed for normal use.
-
-## After rebuilding the companion
-
-When using a stable Apple Development identity, rebuilding preserves the app's
-macOS permission identity. Keep the certificate, bundle identifier, and install
-path unchanged.
-
-When using the default ad-hoc signature, rebuilding changes the permission
-identity. Reset and grant both permissions again:
-
-```sh
-tccutil reset Accessibility com.xai.grok.computer-use
-tccutil reset ScreenCapture com.xai.grok.computer-use
-open -gj "$HOME/Applications/Grok Computer Use.app"
-```
-
-Do not rebuild the companion between granting permissions and testing it.
+Normal launches need only `computer-use-macos/scripts/run-local.sh`; unchanged
+Swift and Rust targets use their incremental builds.
