@@ -1,0 +1,24 @@
+[package]
+name = "grok-computer-use-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+computer-use-core = { path = "../computer-use-core" }
+hmac.workspace = true
+libc.workspace = true
+png.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+uuid.workspace = true
+x11rb.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

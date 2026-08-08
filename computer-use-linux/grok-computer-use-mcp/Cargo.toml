@@ -1,0 +1,14 @@
+[package]
+name = "grok-computer-use-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+computer-use-core = { path = "../computer-use-core" }
+libc.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
