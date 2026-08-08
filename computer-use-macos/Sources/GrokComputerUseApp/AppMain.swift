@@ -29,7 +29,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             let singletonLease = try AgentSocketServer.acquireSingletonLease(at: socketURL)
             requestPermissionsIfNeeded()
             let receipts = try DurableReceiptStore(directory: ComputerUsePaths.receiptsDirectory())
-            let runtime = try ComputerUseRuntime(driver: MacOSDesktopDriver(), receipts: receipts)
+            let baseDriver = MacOSDesktopDriver()
+            #if DEBUG
+            let driver: any DesktopDriving = LocalE2EDesktopDriver(base: baseDriver) ?? baseDriver
+            #else
+            let driver: any DesktopDriving = baseDriver
+            #endif
+            let runtime = try ComputerUseRuntime(driver: driver, receipts: receipts)
             let server = try AgentSocketServer(
                 socketURL: socketURL,
                 runtime: runtime,
