@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -16,7 +17,6 @@ RUNTIME_DIR = "/root/modal-runtime"
 LOG_DIR = "/root/modal-logs"
 
 
-desktop_state = modal.Volume.from_name(f"{APP_NAME}-state", create_if_missing=True)
 desktop_logs = modal.Volume.from_name(f"{APP_NAME}-logs", create_if_missing=True)
 
 image = (
@@ -67,32 +67,52 @@ def desktop_env() -> dict[str, str]:
     }
 
 
-@app.function(
+def wait_for_port(port: int, *, timeout_seconds: float, process: subprocess.Popen[bytes] | None = None) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"desktop process exited with status {process.returncode}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError(f"timed out waiting for port {port}")
+
+
+@app.server(
     image=image,
-    timeout=60 * 60 * 24,
+    port=6080,
+    unauthenticated=True,
     min_containers=1,
     scaledown_window=60 * 30,
-    volumes={
-        SUPPORT_DIR: desktop_state,
-        LOG_DIR: desktop_logs,
-    },
+    volumes={LOG_DIR: desktop_logs},
 )
-@modal.web_server(6080, startup_timeout=180)
-def desktop() -> None:
-    subprocess.run(
-        ["/bin/bash", "-lc", f"cd {REMOTE_SUBTREE} && ./scripts/start_modal_x11_demo.sh"],
-        env=desktop_env(),
-        check=True,
-    )
+class Desktop:
+    @modal.enter()
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            ["/bin/bash", "-lc", f"cd {REMOTE_SUBTREE} && ./scripts/start_modal_x11_demo.sh"],
+            env=desktop_env(),
+            start_new_session=True,
+        )
+        wait_for_port(6080, timeout_seconds=180, process=self.process)
+
+    @modal.exit()
+    def stop(self) -> None:
+        if getattr(self, "process", None) is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
 
 
 @app.function(
     image=image,
     timeout=60 * 10,
-    volumes={
-        SUPPORT_DIR: desktop_state,
-        LOG_DIR: desktop_logs,
-    },
+    volumes={LOG_DIR: desktop_logs},
 )
 def smoke_test() -> str:
     env = {

@@ -39,6 +39,7 @@ require_binary Xvfb
 require_binary openbox
 require_binary xterm
 require_binary x11vnc
+require_binary tail
 
 NOVNC_PROXY="$(find_novnc_proxy)" || {
     printf 'noVNC proxy was not found\n' >&2
@@ -77,15 +78,25 @@ xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 || {
 openbox >"${LOG_ROOT}/openbox.log" 2>&1 &
 sleep 2
 
+touch "${LOG_ROOT}/daemon.log"
 "${INSTALL_DIR}/grok-computer-use-daemon" >"${LOG_ROOT}/daemon.log" 2>&1 &
+DAEMON_PID=$!
 for _ in $(seq 1 30); do
     if [[ -S "${XDG_RUNTIME_DIR}/grok-computer-use/agent-v2.sock" ]]; then
         break
+    fi
+    if ! kill -0 "${DAEMON_PID}" >/dev/null 2>&1; then
+        printf 'daemon exited before socket became ready\n' >&2
+        tail -n 80 "${LOG_ROOT}/daemon.log" >&2 || true
+        exit 1
     fi
     sleep 1
 done
 [[ -S "${XDG_RUNTIME_DIR}/grok-computer-use/agent-v2.sock" ]] || {
     printf 'daemon socket did not become ready\n' >&2
+    if ! kill -0 "${DAEMON_PID}" >/dev/null 2>&1; then
+        tail -n 80 "${LOG_ROOT}/daemon.log" >&2 || true
+    fi
     exit 1
 }
 
