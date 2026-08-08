@@ -1532,6 +1532,37 @@ impl FinalizedToolset {
         self.call_with_cancellation(tool_name, tool_args, tool_call_id, cwd_override, None)
             .await
     }
+
+    /// Dispatch with a caller-provided runtime context.
+    ///
+    /// This is intentionally narrower than installing values in the toolset's
+    /// shared resources: capability-bearing extensions remain scoped to one
+    /// invocation and cannot leak into concurrent calls.
+    pub async fn call_with_context(
+        self: &Arc<Self>,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        context: xai_tool_runtime::ToolCallContext,
+        cwd_override: Option<std::path::PathBuf>,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        use futures::StreamExt;
+        let tool_call_id = context.call_id.to_string();
+        let mut stream = self.call_streaming_inner(
+            tool_name,
+            tool_args,
+            &tool_call_id,
+            cwd_override,
+            None,
+            Some(context),
+        );
+        while let Some(item) = stream.next().await {
+            match item {
+                xai_tool_runtime::ToolStreamItem::Progress(_) => continue,
+                xai_tool_runtime::ToolStreamItem::Terminal(result) => return result,
+            }
+        }
+        Err(stream_no_terminal_error())
+    }
     /// Dispatch with cooperative cancellation exposed to the tool.
     pub async fn call_with_cancellation(
         self: &Arc<Self>,
@@ -1595,6 +1626,25 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
+        self.call_streaming_inner(
+            tool_name,
+            tool_args,
+            tool_call_id,
+            cwd_override,
+            cancellation,
+            None,
+        )
+    }
+
+    fn call_streaming_inner(
+        self: &Arc<Self>,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        tool_call_id: &str,
+        cwd_override: Option<std::path::PathBuf>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+        context: Option<xai_tool_runtime::ToolCallContext>,
+    ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
         use futures::StreamExt;
         let this = Arc::clone(self);
         let tool_name = tool_name.to_owned();
@@ -1606,6 +1656,7 @@ impl FinalizedToolset {
                 &tool_call_id,
                 cwd_override,
                 cancellation,
+                context,
             ) {
                 Ok(parts) => parts,
                 Err(e) => {
@@ -1656,6 +1707,7 @@ impl FinalizedToolset {
         tool_call_id: &str,
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
+        context: Option<xai_tool_runtime::ToolCallContext>,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
         let (registry_id, output_converter, reverse_params) = {
             let tools = self.tools.read();
@@ -1686,7 +1738,7 @@ impl FinalizedToolset {
         let contract_version = self.get_contract_version(tool_name);
         let rt_call_id = xai_tool_protocol::ToolCallId::new(tool_call_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7());
-        let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
+        let mut ctx = context.unwrap_or_else(|| xai_tool_runtime::ToolCallContext::new(rt_call_id));
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
         ctx.extensions.insert(
@@ -4893,6 +4945,7 @@ mod tests {
                 "test-call",
                 None,
                 None,
+                None,
             )
             .expect("prepare_dispatch succeeds");
         let wvc = parts
@@ -4910,6 +4963,7 @@ mod tests {
                 "read_file",
                 serde_json::json!({"target_file": "noop"}),
                 "test-call",
+                None,
                 None,
                 None,
             )

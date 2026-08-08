@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use agent_client_protocol as acp;
@@ -31,6 +32,14 @@ use rmcp::{
 };
 
 use crate::oauth_config::McpOAuthConfig;
+
+pub use crate::computer_use::{
+    ATTEST_SNAPSHOT_DELIVERY_TOOL, COMPUTER_USE_MCP_SERVER_NAME,
+    COMPUTER_USE_OBSERVATION_PLACEHOLDER, COMPUTER_USE_V2_META_KEY, ComputerUseCaptureGeometry,
+    ComputerUseContractError, ComputerUseDeliveryAttestation, ComputerUseInvocationContext,
+    ComputerUseLifecycleRequest, ComputerUseObservation, ComputerUseObservationCarrier,
+    ComputerUseObservationHandoff, TrustedMcpProfile, TrustedMcpServerSpec,
+};
 
 use xai_grok_tools::types::{
     output::{MCPOutput, MCPOutputDetails, ToolOutput},
@@ -131,6 +140,22 @@ pub type McpServerName = String;
 
 /// Unqualified MCP tool name (e.g. `"create_issue"`, without the `server__` prefix).
 type ToolName = String;
+
+fn without_reserved_computer_use_configs(configs: Vec<acp::McpServer>) -> Vec<acp::McpServer> {
+    configs
+        .into_iter()
+        .filter(|server| {
+            let reserved = crate::computer_use::is_reserved_server_name(mcp_server_name(server));
+            if reserved {
+                tracing::warn!(
+                    server = mcp_server_name(server),
+                    "Ignoring generic MCP config that claims the reserved computer-use name"
+                );
+            }
+            !reserved
+        })
+        .collect()
+}
 
 /// Typed state machine for MCP-pool initialization.
 ///
@@ -354,6 +379,13 @@ struct AcpMcpRegistry {
 pub struct McpState {
     pub configs: Vec<acp::McpServer>,
     pub meta_config_map: McpMetaConfigMap,
+    /// Capability-bearing native profile, kept outside `configs` so generic
+    /// config updates cannot create, replace, or remove it.
+    trusted_server: Option<TrustedMcpServerSpec>,
+    /// Exact observation already drained for the next protected sampler
+    /// request. Kept in MCP state so session actors do not need a second,
+    /// independently-correlated "latest observation" slot.
+    pending_computer_use_handoff: Option<ComputerUseObservationHandoff>,
     /// Clients owned by this session; cleared on config changes.
     pub owned_clients: HashMap<McpServerName, Arc<McpClient>>,
     /// Clients inherited from parent via `SharedMcpPool`; never cleared by config changes.
@@ -425,8 +457,10 @@ impl McpState {
 
     pub fn new_with_meta(configs: Vec<acp::McpServer>, meta_config_map: McpMetaConfigMap) -> Self {
         Self {
-            configs,
+            configs: without_reserved_computer_use_configs(configs),
             meta_config_map,
+            trusted_server: None,
+            pending_computer_use_handoff: None,
             owned_clients: HashMap::new(),
             shared_clients: HashMap::new(),
             acp_mcp: None,
@@ -440,6 +474,131 @@ impl McpState {
             event_writer: xai_file_utils::events::EventWriter::noop(),
             client_event_tx: None,
         }
+    }
+
+    /// Construct a session state with the native profile capability.
+    ///
+    /// `relay_path` must be the exact app-bundle relay suffix. The shell is
+    /// responsible for verifying the path chain and code signature before it
+    /// calls this constructor. Generic MCP config has no route to this API.
+    pub fn new_with_trusted_profile(
+        configs: Vec<acp::McpServer>,
+        meta_config_map: McpMetaConfigMap,
+        profile: TrustedMcpProfile,
+        relay_path: PathBuf,
+    ) -> Result<Self, McpError> {
+        let mut state = Self::new_with_meta(configs, meta_config_map);
+        state.install_trusted_profile(profile, relay_path)?;
+        Ok(state)
+    }
+
+    /// Mint or replace the capability-bearing trusted relay specification.
+    pub fn install_trusted_profile(
+        &mut self,
+        profile: TrustedMcpProfile,
+        relay_path: PathBuf,
+    ) -> Result<(), McpError> {
+        if !relay_path.is_absolute()
+            || !relay_path.ends_with(crate::computer_use::TRUSTED_RELAY_PATH_SUFFIX)
+        {
+            return Err(McpError::ClientError(
+                "trusted computer-use relay path does not match the reserved app relay".to_string(),
+            ));
+        }
+        if let Some(previous) = self.trusted_server.take() {
+            previous.observations.invalidate_all();
+        }
+        self.pending_computer_use_handoff = None;
+        self.trusted_server = Some(TrustedMcpServerSpec::new(profile, relay_path));
+        self.owned_clients.remove(COMPUTER_USE_MCP_SERVER_NAME);
+        self.shared_clients
+            .retain(|name, _| !crate::computer_use::is_reserved_server_name(name));
+        self.init_progress.cancel();
+        self.generation = self.generation.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Clone the moveable capability used by [`start_trusted_mcp_server`].
+    pub fn trusted_server_spec(&self) -> Option<TrustedMcpServerSpec> {
+        self.trusted_server.clone()
+    }
+
+    pub fn has_trusted_computer_use_profile(&self) -> bool {
+        self.trusted_server
+            .as_ref()
+            .is_some_and(|spec| spec.profile == TrustedMcpProfile::ComputerUseV2)
+    }
+
+    /// Whether a qualified tool belongs to the installed native profile,
+    /// without requiring its client handshake to have completed yet.
+    ///
+    /// This predicate is safe for pre-registration redaction and policy
+    /// decisions because the capability is minted only by trusted host wiring;
+    /// a matching lexical server name from generic config is insufficient.
+    pub fn is_configured_trusted_computer_use_tool(&self, qualified_name: &str) -> bool {
+        let Some((_, server, tool)) = parse_mcp_qualified_name(qualified_name) else {
+            return false;
+        };
+        crate::computer_use::is_reserved_server_name(server)
+            && crate::computer_use::classify_tool(tool).is_some()
+            && self
+                .trusted_server
+                .as_ref()
+                .is_some_and(|spec| spec.profile == TrustedMcpProfile::ComputerUseV2)
+    }
+
+    /// Whether a qualified tool belongs to the connected, capability-bearing
+    /// native client.
+    pub fn is_trusted_computer_use_tool(&self, qualified_name: &str) -> bool {
+        self.is_configured_trusted_computer_use_tool(qualified_name)
+            && self
+                .get_client(COMPUTER_USE_MCP_SERVER_NAME)
+                .is_some_and(|client| {
+                    client.trusted_profile() == Some(TrustedMcpProfile::ComputerUseV2)
+                })
+    }
+
+    /// Drain the observation for exactly `logical_call_id` and arm it as the
+    /// sole protected handoff for the next sampler request.
+    pub fn arm_computer_use_handoff(
+        &mut self,
+        logical_call_id: &str,
+        workflow_id: &str,
+    ) -> Result<(), ComputerUseContractError> {
+        if self.pending_computer_use_handoff.is_some() {
+            return Err(ComputerUseContractError::HandoffAlreadyPending);
+        }
+        let observation = self
+            .trusted_server
+            .as_ref()
+            .filter(|trusted| trusted.profile == TrustedMcpProfile::ComputerUseV2)
+            .and_then(|trusted| trusted.observations.take(logical_call_id))
+            .ok_or(ComputerUseContractError::ObservationUnavailable)?;
+        let handoff = ComputerUseObservationHandoff::new(workflow_id.to_string(), observation)?;
+        self.pending_computer_use_handoff = Some(handoff);
+        Ok(())
+    }
+
+    /// Take the exact pending handoff once. No latest-observation fallback is
+    /// available anywhere in the capability-bearing path.
+    pub fn take_computer_use_handoff(&mut self) -> Option<ComputerUseObservationHandoff> {
+        self.pending_computer_use_handoff.take()
+    }
+
+    /// Destroy every in-memory protected observation and any armed handoff.
+    pub fn invalidate_computer_use_handoff(&mut self) {
+        self.pending_computer_use_handoff = None;
+        if let Some(trusted) = &self.trusted_server {
+            trusted.observations.invalidate_all();
+        }
+    }
+
+    /// Clone the client, then release the `McpState` lock before awaiting a
+    /// hidden lifecycle call such as snapshot-delivery attestation.
+    pub fn trusted_computer_use_client(&self) -> Option<Arc<McpClient>> {
+        self.get_client(COMPUTER_USE_MCP_SERVER_NAME)
+            .filter(|client| client.trusted_profile() == Some(TrustedMcpProfile::ComputerUseV2))
+            .cloned()
     }
 
     /// Install (or remove) the [`McpClientEvent`] sender owned by the
@@ -564,13 +723,18 @@ impl McpState {
     /// Update configs and reset initialization state.
     /// Returns true if the configs actually changed, false if they were identical.
     pub fn update_configs(&mut self, new_configs: Vec<acp::McpServer>) -> bool {
+        let new_configs = without_reserved_computer_use_configs(new_configs);
         if mcp_servers_equal(&self.configs, &new_configs) {
             tracing::debug!("MCP configs unchanged, skipping update");
             return false;
         }
 
-        // Clear owned clients only — shared (inherited) clients are untouched.
-        self.owned_clients.clear();
+        // Preserve the separately-capability-gated native client. Generic
+        // config replacement must not remove or replace it.
+        self.owned_clients.retain(|name, client| {
+            crate::computer_use::is_reserved_server_name(name)
+                && client.trusted_profile() == Some(TrustedMcpProfile::ComputerUseV2)
+        });
         self.mcp_tool_meta.clear();
         self.disabled_tool_registrations.clear();
         self.configs = new_configs;
@@ -589,6 +753,7 @@ impl McpState {
         &mut self,
         new_configs: Vec<acp::McpServer>,
     ) -> Option<McpConfigDiff> {
+        let new_configs = without_reserved_computer_use_configs(new_configs);
         if mcp_servers_equal(&self.configs, &new_configs) {
             tracing::debug!("MCP configs unchanged, skipping update");
             return None;
@@ -918,7 +1083,10 @@ impl McpState {
         let config_names: std::collections::HashSet<&str> =
             self.configs.iter().map(mcp_server_name).collect();
         for (name, client) in &pool.clients {
-            if !config_names.contains(name.as_str()) {
+            if !config_names.contains(name.as_str())
+                && !crate::computer_use::is_reserved_server_name(name)
+                && client.trusted_profile().is_none()
+            {
                 self.shared_clients.insert(name.clone(), Arc::clone(client));
             }
         }
@@ -945,6 +1113,10 @@ impl SharedMcpPool {
         Self {
             clients: state
                 .all_clients()
+                .filter(|(name, client)| {
+                    !crate::computer_use::is_reserved_server_name(name)
+                        && client.trusted_profile().is_none()
+                })
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
                 .collect(),
             configs: state.configs.clone(),
@@ -1015,6 +1187,7 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 6000;
 /// How long a stdio server gets to exit after its transport closes before
 /// its process group is killed.
 const STDIO_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const COMPUTER_USE_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Timeout for OAuth metadata discovery when building an HTTP transport.
 /// Bounds transport setup for servers without OAuth support.
@@ -1241,6 +1414,8 @@ pub struct McpTool {
     mcp_state: Arc<Mutex<McpState>>,
     schema: serde_json::Value,
     meta: Option<serde_json::Value>,
+    trusted_profile: Option<TrustedMcpProfile>,
+    computer_use_observations: Option<Arc<ComputerUseObservationCarrier>>,
 }
 
 /// Data needed to register an MCP tool via `register_erased()`.
@@ -1280,6 +1455,8 @@ impl McpTool {
             mcp_state,
             schema,
             meta,
+            trusted_profile: None,
+            computer_use_observations: None,
         }
     }
 
@@ -1391,7 +1568,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
 
     async fn run(
         &self,
-        _ctx: xai_tool_runtime::ToolCallContext,
+        ctx: xai_tool_runtime::ToolCallContext,
         raw: serde_json::Value,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         let mcp_call_start = std::time::Instant::now();
@@ -1408,6 +1585,35 @@ impl xai_tool_runtime::Tool for McpErasedTool {
 
         let server = &self.tool.server_name;
         let tool = &self.tool.name;
+        let trusted_call = if self.tool.trusted_profile == Some(TrustedMcpProfile::ComputerUseV2) {
+            let class = crate::computer_use::classify_tool(tool).ok_or_else(|| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "tool is not part of the trusted computer-use contract",
+                )
+            })?;
+            let invocation = ctx.get::<ComputerUseInvocationContext>().ok_or_else(|| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "trusted computer-use invocation context is missing",
+                )
+            })?;
+            let meta = invocation
+                .request_meta(ctx.call_id.as_str(), tool)
+                .map_err(|error| {
+                    xai_tool_runtime::ToolError::custom("process_manager", error.to_string())
+                })?;
+            Some((class, invocation, meta))
+        } else {
+            None
+        };
+        // A trusted relay path is signature-checked by the shell before the
+        // client is constructed. `McpClient::recover` would execute that path
+        // again without repeating the platform trust check, so even otherwise
+        // read-only observation calls must fail closed on transport ambiguity.
+        // A later, host-controlled initialization pass may create a freshly
+        // verified client; this invocation is never replayed.
+        let allow_replay = allows_automatic_tool_recovery(self.tool.trusted_profile);
         let tool_timeout = client.tool_timeout_for(tool);
         let qualified_name = format!("{}{}{}", server, MCP_TOOL_NAME_DELIMITER, tool);
         event_writer.emit(xai_file_utils::events::Event::McpToolCallStarted {
@@ -1422,11 +1628,19 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let mut is_timeout = false;
         let ew = &event_writer;
         let dispatch_result = match self
-            .try_call_tool(&client, &raw, &mut reconnect_attempted, &mut is_timeout, ew)
+            .try_call_tool_with_policy(
+                &client,
+                &raw,
+                trusted_call.as_ref().map(|(_, _, meta)| meta.clone()),
+                allow_replay,
+                &mut reconnect_attempted,
+                &mut is_timeout,
+                ew,
+            )
             .await
         {
             Ok(result) => Ok(result),
-            Err(first_err) if client.has_auth() => {
+            Err(first_err) if client.has_auth() && allow_replay => {
                 auth_retry_attempted = true;
                 let reauth_ok = client.force_reauth(false).await;
                 ew.emit(xai_file_utils::events::Event::McpAuthRetry {
@@ -1435,11 +1649,19 @@ impl xai_tool_runtime::Tool for McpErasedTool {
                     success: reauth_ok,
                 });
                 if reauth_ok {
-                    self.try_call_tool(&client, &raw, &mut reconnect_attempted, &mut is_timeout, ew)
-                        .await
-                        .map_err(|e| {
-                            xai_tool_runtime::ToolError::custom("process_manager", e.to_string())
-                        })
+                    self.try_call_tool_with_policy(
+                        &client,
+                        &raw,
+                        trusted_call.as_ref().map(|(_, _, meta)| meta.clone()),
+                        allow_replay,
+                        &mut reconnect_attempted,
+                        &mut is_timeout,
+                        ew,
+                    )
+                    .await
+                    .map_err(|e| {
+                        xai_tool_runtime::ToolError::custom("process_manager", e.to_string())
+                    })
                 } else {
                     Err(first_err)
                 }
@@ -1466,7 +1688,73 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         };
 
         let is_error = call_result.is_error.unwrap_or(false);
-        let mut output = if is_error {
+        let mut output = if let Some((class, invocation, _)) = trusted_call.as_ref() {
+            let converted: Result<ToolOutput, xai_tool_runtime::ToolError> = if call_result
+                .is_error
+                .is_none()
+            {
+                Err(xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "trusted computer-use result omitted its explicit success status",
+                ))
+            } else if crate::computer_use::should_capture_observation(tool, *class, &call_result) {
+                crate::computer_use::capture_observation(ctx.call_id.as_str(), call_result)
+                    .map_err(|error| {
+                        xai_tool_runtime::ToolError::custom("process_manager", error.to_string())
+                    })
+                    .and_then(|observation| {
+                        let carrier =
+                            self.tool
+                                .computer_use_observations
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    xai_tool_runtime::ToolError::custom(
+                                        "process_manager",
+                                        "trusted computer-use observation carrier is missing",
+                                    )
+                                })?;
+                        carrier.store(invocation.scope_key(), observation);
+                        Ok(ToolOutput::MCP(MCPOutput::okay_output(
+                            tool.clone(),
+                            server.clone(),
+                            COMPUTER_USE_OBSERVATION_PLACEHOLDER.to_string(),
+                        )))
+                    })
+            } else {
+                crate::computer_use::trusted_text_result(call_result)
+                    .map_err(|error| {
+                        xai_tool_runtime::ToolError::custom("process_manager", error.to_string())
+                    })
+                    .map(|text| {
+                        if is_error {
+                            ToolOutput::MCP(MCPOutput::errored(tool.clone(), server.clone(), text))
+                        } else {
+                            ToolOutput::MCP(MCPOutput::okay_output(
+                                tool.clone(),
+                                server.clone(),
+                                text,
+                            ))
+                        }
+                    })
+            };
+            match converted {
+                Ok(output) => output,
+                Err(error) => {
+                    ew.emit(xai_file_utils::events::Event::McpToolCallCompleted {
+                        server_name: server.clone(),
+                        tool_name: tool.clone(),
+                        call_id: qualified_name.clone(),
+                        duration_ms: mcp_call_start.elapsed().as_millis() as u64,
+                        success: false,
+                        is_timeout,
+                        error: Some(error.to_string()),
+                        reconnect_attempted,
+                        auth_retry_attempted,
+                    });
+                    return Err(error);
+                }
+            }
+        } else if is_error {
             let error_msg = call_result
                 .content
                 .iter()
@@ -1606,11 +1894,32 @@ fn should_recover_service_error(
         )
 }
 
+fn allows_automatic_tool_recovery(profile: Option<TrustedMcpProfile>) -> bool {
+    profile.is_none()
+}
+
 impl McpErasedTool {
+    /// Generic MCP compatibility wrapper used by existing callers/tests.
+    #[cfg(test)]
     async fn try_call_tool(
         &self,
         client: &Arc<McpClient>,
         raw: &serde_json::Value,
+        reconnect_attempted: &mut bool,
+        is_timeout: &mut bool,
+        ew: &xai_file_utils::events::EventWriter,
+    ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
+        self.try_call_tool_with_policy(client, raw, None, true, reconnect_attempted, is_timeout, ew)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_call_tool_with_policy(
+        &self,
+        client: &Arc<McpClient>,
+        raw: &serde_json::Value,
+        trusted_meta: Option<rmcp::model::Meta>,
+        allow_recovery: bool,
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
         ew: &xai_file_utils::events::EventWriter,
@@ -1622,7 +1931,19 @@ impl McpErasedTool {
         let tool_timeout = client.tool_timeout_for(&self.tool.name);
         let timeout_duration = std::time::Duration::from_secs(tool_timeout);
         let mut params = CallToolRequestParams::new(self.tool.name.clone());
-        params.arguments = raw.as_object().cloned();
+        if let Some(meta) = trusted_meta {
+            let mut arguments = raw.as_object().cloned().unwrap_or_default();
+            // The model supplies tool arguments, never protocol authority.
+            // Strip both plausible forgery locations before adding the
+            // trusted top-level request `_meta`.
+            arguments.remove("_meta");
+            arguments.remove(COMPUTER_USE_V2_META_KEY);
+            params.arguments = Some(arguments);
+            params.meta = Some(meta);
+        } else {
+            // Keep ordinary MCP's historical non-object behavior unchanged.
+            params.arguments = raw.as_object().cloned();
+        }
 
         let result =
             tokio::time::timeout(timeout_duration, mcp_service.call_tool(params.clone())).await;
@@ -1630,11 +1951,12 @@ impl McpErasedTool {
         match result {
             Ok(Ok(call_result)) => Ok(call_result),
             Ok(Err(service_err))
-                if should_recover_service_error(
-                    &service_err,
-                    client.is_http(),
-                    *reconnect_attempted,
-                ) =>
+                if allow_recovery
+                    && should_recover_service_error(
+                        &service_err,
+                        client.is_http(),
+                        *reconnect_attempted,
+                    ) =>
             {
                 self.recover_and_retry(
                     client,
@@ -1655,7 +1977,7 @@ impl McpErasedTool {
             Err(_) => {
                 *is_timeout = true;
                 // Reset for the next call but don't retry — a slow side-effecting tool must not run twice.
-                if client.is_http() && !*reconnect_attempted {
+                if allow_recovery && client.is_http() && !*reconnect_attempted {
                     client.reset_transport().await;
                     *reconnect_attempted = true;
                 }
@@ -2540,6 +2862,10 @@ pub struct McpClient {
     /// Unique identity of this client *instance*. See [`Self::client_id`].
     client_id: u64,
     server_name: McpServerName,
+    /// Present only on a client constructed from a non-forgeable
+    /// [`TrustedMcpServerSpec`]. Never inferred from `server_name`.
+    trusted_profile: Option<TrustedMcpProfile>,
+    computer_use_observations: Option<Arc<ComputerUseObservationCarrier>>,
     state: Mutex<ClientState>,
     /// Wakes [`Self::ensure_initialized`] callers that observed
     /// [`ClientState::Initializing`] and parked. Notified after each
@@ -2729,6 +3055,8 @@ impl McpClient {
         Self {
             client_id: next_client_id(),
             server_name,
+            trusted_profile: None,
+            computer_use_observations: None,
             state: Mutex::new(ClientState::Pending(transport)),
             init_done: Notify::new(),
             startup_timeout_sec,
@@ -3087,6 +3415,16 @@ impl McpClient {
             *guard = new_state;
         }
         self.init_done.notify_waiters();
+    }
+
+    fn with_trusted_spec(mut self, spec: &TrustedMcpServerSpec) -> Self {
+        self.trusted_profile = Some(spec.profile);
+        self.computer_use_observations = Some(Arc::clone(&spec.observations));
+        self
+    }
+
+    pub fn trusted_profile(&self) -> Option<TrustedMcpProfile> {
+        self.trusted_profile
     }
 
     pub fn new_stdio(
@@ -3897,6 +4235,11 @@ impl McpClient {
             }
         }
 
+        if self.trusted_profile == Some(TrustedMcpProfile::ComputerUseV2) {
+            crate::computer_use::verify_tool_catalog(&all_tools)
+                .map_err(|error| McpError::ClientError(error.to_string()))?;
+        }
+
         let registrations: Vec<_> = all_tools
             .into_iter()
             .filter_map(|tool| {
@@ -3927,7 +4270,15 @@ impl McpClient {
                     server_name: self.server_name.clone(),
                     mcp_state: Arc::clone(&mcp_state),
                     schema,
-                    meta,
+                    // Trusted tools are always model-visible and never accept
+                    // server-supplied UI routing metadata as authority.
+                    meta: if self.trusted_profile.is_some() {
+                        None
+                    } else {
+                        meta
+                    },
+                    trusted_profile: self.trusted_profile,
+                    computer_use_observations: self.computer_use_observations.clone(),
                 };
                 // Invalid tools (bad names) return None and are skipped
                 mcp_tool.into_registration()
@@ -3969,6 +4320,11 @@ impl McpClient {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
+        if self.trusted_profile.is_some() {
+            return Err(McpError::ClientError(
+                "trusted MCP clients are unavailable through the generic tool API".to_string(),
+            ));
+        }
         let mcp_service = self.ensure_initialized().await?;
         let result = mcp_service
             .call_tool({
@@ -3978,6 +4334,57 @@ impl McpClient {
             })
             .await?;
         Ok(result)
+    }
+
+    /// Call one fixed hidden computer-use lifecycle operation on the already
+    /// connected capability-bearing relay.
+    ///
+    /// This path deliberately does not initialize, re-authenticate, reconnect,
+    /// reset the transport, or retry after any error or timeout. Delivery
+    /// attestation and lease mutations are tied to one authenticated relay
+    /// session; replaying them on a replacement connection would be unsafe.
+    pub async fn call_computer_use_lifecycle(
+        &self,
+        request: ComputerUseLifecycleRequest,
+        invocation: &ComputerUseInvocationContext,
+        logical_call_id: &str,
+    ) -> Result<(), McpError> {
+        if self.trusted_profile != Some(TrustedMcpProfile::ComputerUseV2) {
+            return Err(McpError::ClientError(
+                "computer-use lifecycle call requires the trusted v2 capability".to_string(),
+            ));
+        }
+
+        let tool_name = request.tool_name();
+        let expected_success_text = request.expected_success_text();
+        let meta = invocation
+            .request_meta(logical_call_id, tool_name)
+            .map_err(|error| McpError::ClientError(error.to_string()))?;
+        let arguments = request.into_arguments();
+        let service = {
+            let state = self.state.lock().await;
+            match &*state {
+                ClientState::Ready(service) => Arc::clone(service),
+                _ => {
+                    return Err(McpError::ClientError(
+                        "trusted computer-use relay is not connected".to_string(),
+                    ));
+                }
+            }
+        };
+
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        params.arguments = Some(arguments);
+        params.meta = Some(meta);
+        let result =
+            tokio::time::timeout(COMPUTER_USE_LIFECYCLE_TIMEOUT, service.call_tool(params))
+                .await
+                .map_err(|_| {
+                    McpError::timeout(&self.server_name, COMPUTER_USE_LIFECYCLE_TIMEOUT)
+                })??;
+        crate::computer_use::validate_lifecycle_result(result, expected_success_text)
+            .map_err(|error| McpError::ClientError(error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -4161,7 +4568,7 @@ impl<'a> McpSpawnCtx<'a> {
     }
 }
 
-pub async fn start_mcp_server(
+async fn start_mcp_server_inner(
     mcp_server: acp::McpServer,
     overrides: Option<&McpClientTimeoutOverrides>,
     meta_config: Option<&McpServerMetaConfig>,
@@ -4318,6 +4725,42 @@ pub async fn start_mcp_server(
             "unsupported MCP server transport: {other:?}"
         ))),
     }
+}
+
+/// Start an ordinary MCP server. The reserved computer-use identity is
+/// rejected even if a caller bypassed every shell/config admission filter.
+pub async fn start_mcp_server(
+    mcp_server: acp::McpServer,
+    overrides: Option<&McpClientTimeoutOverrides>,
+    meta_config: Option<&McpServerMetaConfig>,
+    byo_config: Option<&McpOAuthConfig>,
+    ctx: &McpSpawnCtx<'_>,
+) -> Result<McpClient, McpError> {
+    if crate::computer_use::is_reserved_server_name(mcp_server_name(&mcp_server)) {
+        return Err(McpError::ClientError(
+            "generic MCP cannot claim the reserved computer-use server name".to_string(),
+        ));
+    }
+    start_mcp_server_inner(mcp_server, overrides, meta_config, byo_config, ctx).await
+}
+
+/// Start the exact relay carried by a capability minted by [`McpState`].
+/// Hidden lifecycle calls and trusted tool registration remain tied to the
+/// returned client's capability fields, never to its lexical server name.
+pub async fn start_trusted_mcp_server(
+    spec: TrustedMcpServerSpec,
+    overrides: Option<&McpClientTimeoutOverrides>,
+    meta_config: Option<&McpServerMetaConfig>,
+    ctx: &McpSpawnCtx<'_>,
+) -> Result<McpClient, McpError> {
+    let server = match spec.profile {
+        TrustedMcpProfile::ComputerUseV2 => acp::McpServer::Stdio(acp::McpServerStdio::new(
+            COMPUTER_USE_MCP_SERVER_NAME,
+            spec.relay_path.clone(),
+        )),
+    };
+    let client = start_mcp_server_inner(server, overrides, meta_config, None, ctx).await?;
+    Ok(client.with_trusted_spec(&spec))
 }
 
 pub async fn start_mcp_servers(
@@ -4514,6 +4957,203 @@ impl ClientHandler for GrokClientHandler {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn trusted_tools_never_use_automatic_transport_recovery() {
+        assert!(allows_automatic_tool_recovery(None));
+        assert!(!allows_automatic_tool_recovery(Some(
+            TrustedMcpProfile::ComputerUseV2,
+        )));
+    }
+
+    #[test]
+    fn computer_use_handoff_requires_exact_call_and_one_pending_value() {
+        let relay_path =
+            PathBuf::from("/tmp/Grok Computer Use.app/Contents/MacOS/grok-computer-use-mcp");
+        let mut state = McpState::new_with_trusted_profile(
+            Vec::new(),
+            McpMetaConfigMap::new(),
+            TrustedMcpProfile::ComputerUseV2,
+            relay_path,
+        )
+        .expect("trusted profile");
+        assert!(state.is_configured_trusted_computer_use_tool("xai_computer_use__click"));
+        assert!(!state.is_trusted_computer_use_tool("xai_computer_use__click"));
+        assert!(!state.is_configured_trusted_computer_use_tool("other__click"));
+        let carrier = Arc::clone(
+            &state
+                .trusted_server
+                .as_ref()
+                .expect("trusted server")
+                .observations,
+        );
+        carrier.store(
+            "session\u{1f}workflow".to_string(),
+            crate::computer_use::test_observation("logical-call-a"),
+        );
+
+        assert_eq!(
+            state.arm_computer_use_handoff("logical-call-b", "workflow"),
+            Err(ComputerUseContractError::ObservationUnavailable),
+        );
+        assert_eq!(
+            carrier.pending_len(),
+            1,
+            "wrong call must not drain observation"
+        );
+
+        state
+            .arm_computer_use_handoff("logical-call-a", "workflow")
+            .expect("exact call arms handoff");
+        carrier.store(
+            "session\u{1f}next-workflow".to_string(),
+            crate::computer_use::test_observation("logical-call-c"),
+        );
+        assert_eq!(
+            state.arm_computer_use_handoff("logical-call-c", "next-workflow"),
+            Err(ComputerUseContractError::HandoffAlreadyPending),
+        );
+        assert_eq!(
+            carrier.pending_len(),
+            1,
+            "pending conflict must not drain next call"
+        );
+
+        let handoff = state.take_computer_use_handoff().expect("one handoff");
+        assert_eq!(handoff.logical_call_id(), "logical-call-a");
+        assert_eq!(handoff.workflow_id(), "workflow");
+        assert!(state.take_computer_use_handoff().is_none());
+
+        state
+            .arm_computer_use_handoff("logical-call-c", "next-workflow")
+            .expect("next exact call arms after take");
+        state.invalidate_computer_use_handoff();
+        assert!(state.take_computer_use_handoff().is_none());
+        assert_eq!(carrier.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_use_lifecycle_call_is_one_shot_with_exact_meta() {
+        use crate::acp_transport::AcpReverseInvoker;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct FailingLifecycleServer {
+            calls: Arc<AtomicUsize>,
+            messages: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AcpReverseInvoker for FailingLifecycleServer {
+            async fn invoke(
+                &self,
+                _server_id: &str,
+                message: serde_json::Value,
+                _timeout: Duration,
+            ) -> Result<serde_json::Value, String> {
+                let id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                match message.get("method").and_then(|method| method.as_str()) {
+                    Some("initialize") => Ok(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": message["params"]["protocolVersion"],
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "computer-use", "version": "0.0.0" },
+                        },
+                    })),
+                    Some("tools/call") => {
+                        self.calls.fetch_add(1, Ordering::SeqCst);
+                        self.messages.lock().unwrap().push(message);
+                        Err("simulated lifecycle transport failure".to_string())
+                    }
+                    Some(other) => Err(format!("unexpected method {other}")),
+                    None => Ok(serde_json::Value::Null),
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spec = TrustedMcpServerSpec::new(
+            TrustedMcpProfile::ComputerUseV2,
+            PathBuf::from("/tmp/Grok Computer Use.app/Contents/MacOS/grok-computer-use-mcp"),
+        );
+        let client = McpClient::new_acp(
+            COMPUTER_USE_MCP_SERVER_NAME.to_string(),
+            "computer-use-test".to_string(),
+            Arc::new(FailingLifecycleServer {
+                calls: Arc::clone(&calls),
+                messages: Arc::clone(&messages),
+            }),
+            None,
+            None,
+        )
+        .with_trusted_spec(&spec);
+        client
+            .ensure_initialized()
+            .await
+            .expect("trusted test client initializes");
+
+        let generic_result = client
+            .call_tool(
+                crate::computer_use::LEASE_HEARTBEAT_TOOL,
+                serde_json::json!({"snapshot_id": "snapshot-identifier"}),
+            )
+            .await;
+        assert!(
+            matches!(generic_result, Err(McpError::ClientError(_))),
+            "generic calls must reject a trusted client before dispatch",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let invocation = ComputerUseInvocationContext::new(
+            "session-identifier",
+            "workflow-identifier",
+            "lifecycle-action-identifier",
+        )
+        .expect("valid lifecycle context");
+        let result = client
+            .call_computer_use_lifecycle(
+                ComputerUseLifecycleRequest::LeaseHeartbeat {
+                    snapshot_id: "snapshot-identifier".to_string(),
+                },
+                &invocation,
+                "lifecycle-logical-call",
+            )
+            .await;
+        assert!(result.is_err(), "transport failure must fail closed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "lifecycle call must not retry"
+        );
+
+        let messages = messages.lock().unwrap();
+        let call = messages.first().expect("one lifecycle request");
+        assert_eq!(
+            call["params"]["name"],
+            crate::computer_use::LEASE_HEARTBEAT_TOOL,
+        );
+        assert_eq!(
+            call["params"]["arguments"],
+            serde_json::json!({"snapshot_id": "snapshot-identifier"}),
+        );
+        assert_eq!(
+            call["params"]["_meta"][COMPUTER_USE_V2_META_KEY],
+            serde_json::json!({
+                "profile": "computer-use-v2",
+                "logical_call_id": "lifecycle-logical-call",
+                "session_id": "session-identifier",
+                "workflow_id": "workflow-identifier",
+                "action_id": "lifecycle-action-identifier",
+                "tool_name": "lease_heartbeat",
+            }),
+        );
+    }
 
     /// A single undecodable line on an MCP stdio server's stdout must NOT
     /// collapse the transport: if the decode error surfaced as `None`, the

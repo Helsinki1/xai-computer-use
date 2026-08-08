@@ -618,6 +618,7 @@ pub(crate) async fn build_mcp_status(
             state.configs.clone(),
             state
                 .all_clients()
+                .filter(|(_, client)| client.trusted_profile().is_none())
                 .map(|(_, c)| c.clone())
                 .collect::<Vec<_>>(),
             state.is_initializing(),
@@ -843,11 +844,15 @@ pub async fn call_mcp_tool(
             server_name.to_string()
         };
 
-        Arc::clone(
-            state
-                .get_client(&target)
-                .ok_or_else(|| format!("server '{}' not found", target))?,
-        )
+        let client = state
+            .get_client(&target)
+            .ok_or_else(|| format!("server '{}' not found", target))?;
+        if client.trusted_profile().is_some() {
+            return Err(
+                "trusted computer-use tools are unavailable through generic MCP calls".to_string(),
+            );
+        }
+        Arc::clone(client)
     };
 
     let tool_timeout_sec = client.tool_timeout_for(tool_name);
@@ -1247,11 +1252,16 @@ pub(crate) async fn read_mcp_resource(
 ) -> Result<McpReadResourceResponse, String> {
     let client = {
         let state = mcp_state.lock().await;
-        Arc::clone(
-            state
-                .get_client(server_name)
-                .ok_or_else(|| format!("server '{}' not found", server_name))?,
-        )
+        let client = state
+            .get_client(server_name)
+            .ok_or_else(|| format!("server '{}' not found", server_name))?;
+        if client.trusted_profile().is_some() {
+            return Err(
+                "trusted computer-use resources are unavailable through generic MCP calls"
+                    .to_string(),
+            );
+        }
+        Arc::clone(client)
     };
 
     let mcp_service = client
@@ -1341,11 +1351,20 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
             let state = self.0.lock().await;
             match &server {
                 Some(name) => match state.get_client(name) {
-                    Some(c) => vec![(name.clone(), Arc::clone(c))],
+                    Some(c) if c.trusted_profile().is_none() => {
+                        vec![(name.clone(), Arc::clone(c))]
+                    }
+                    Some(_) => {
+                        return Err(
+                            "trusted computer-use resources are unavailable through generic MCP calls"
+                                .to_string(),
+                        );
+                    }
                     None => return Err(format!("MCP server '{name}' not found")),
                 },
                 None => state
                     .all_clients()
+                    .filter(|(_, client)| client.trusted_profile().is_none())
                     .map(|(name, client)| (name.to_string(), Arc::clone(client)))
                     .collect(),
             }
@@ -1401,11 +1420,16 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
     ) -> Result<xai_grok_tools::types::resources::McpResourceReadResult, String> {
         let client = {
             let state = self.0.lock().await;
-            Arc::clone(
-                state
-                    .get_client(&server)
-                    .ok_or_else(|| format!("MCP server '{server}' not found"))?,
-            )
+            let client = state
+                .get_client(&server)
+                .ok_or_else(|| format!("MCP server '{server}' not found"))?;
+            if client.trusted_profile().is_some() {
+                return Err(
+                    "trusted computer-use resources are unavailable through generic MCP calls"
+                        .to_string(),
+                );
+            }
+            Arc::clone(client)
         };
 
         let mcp_service = client

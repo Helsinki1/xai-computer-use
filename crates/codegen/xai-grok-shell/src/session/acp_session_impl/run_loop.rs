@@ -133,6 +133,10 @@ impl SessionActor {
     }
 }
 async fn shutdown_workflows(session: &SessionActor) {
+    // Centralized for explicit shutdown, command-channel close, and
+    // completion-channel close. Native invalidation is idempotent and also
+    // clears the exact in-memory protected handoff before persistence flush.
+    session.invalidate_computer_use_session().await;
     if let Err(run_ids) = session
         .workflow_manager
         .lock()
@@ -1374,6 +1378,12 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
+                            if xai_grok_mcp::computer_use::is_reserved_server_name(&server_name) {
+                                let _ = respond_to.send(Err(acp::Error::invalid_params().data(
+                                    "the trusted computer-use server cannot be toggled through generic MCP APIs",
+                                )));
+                                continue;
+                            }
                             session.events.emit(xai_file_utils::events::Event::McpServerToggled {
                                 server_name: server_name.clone(),
                                 enabled,
@@ -1477,6 +1487,12 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, respond_to } => {
+                            if xai_grok_mcp::computer_use::is_reserved_server_name(&server_name) {
+                                let _ = respond_to.send(Err(acp::Error::invalid_params().data(
+                                    "trusted computer-use tools cannot be toggled through generic MCP APIs",
+                                )));
+                                continue;
+                            }
                             if is_managed_gateway {
                                 let mut disabled_tools = crate::util::config::get_all_mcp_disabled_tools(std::path::Path::new(&session.session_info.cwd));
                                 if tool_name.is_empty() {

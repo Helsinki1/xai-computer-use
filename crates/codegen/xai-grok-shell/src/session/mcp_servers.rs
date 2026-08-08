@@ -95,6 +95,31 @@ pub(crate) async fn build_pending_clients(
         ctx,
     )
     .await;
+    let trusted_spec = {
+        let state = mcp_state.lock().await;
+        state
+            .trusted_server_spec()
+            .filter(|_| state.trusted_computer_use_client().is_none())
+    };
+    if let Some(spec) = trusted_spec {
+        // Re-establish the filesystem and code-signing trust decision for
+        // every process launch. The stored capability identifies the intended
+        // path, but must not authorize a replacement that appeared after the
+        // session's initial verification.
+        if crate::util::computer_use::trusted_relay_path().as_deref() != Some(spec.relay_path()) {
+            results.push(Err(inner::McpError::ClientError(
+                "trusted computer-use relay changed or failed re-verification".to_string(),
+            )));
+        } else {
+            // Do not inherit generic per-server metadata (headers, image
+            // exposure, or auth) for the capability-bearing native relay.
+            let overrides = inner::McpClientTimeoutOverrides {
+                startup_timeout_sec: Some(crate::util::config::resolved_mcp_startup_timeout_secs()),
+                ..Default::default()
+            };
+            results.push(inner::start_trusted_mcp_server(spec, Some(&overrides), None, ctx).await);
+        }
+    }
     // Re-resolve SDK (ACP) config.toml overrides for THIS init, matching HTTP/stdio, so a
     // mid-session config change applies on the next init (resolved outside the lock — it
     // reads config.toml — then handed to the pure, under-lock builder).

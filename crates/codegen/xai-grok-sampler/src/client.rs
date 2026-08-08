@@ -31,6 +31,9 @@ use xai_grok_sampling_types::{
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
+use crate::protected_overlay::{
+    ProtectedBodyAttachment, ProtectedInferenceOverlay, ProtectedOverlayAckGuard,
+};
 use xai_grok_auth::bearer_suffix;
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
@@ -970,6 +973,17 @@ impl SamplingClient {
         BoxStream<'static, Result<ChatCompletionChunk>>,
         Option<ResponseModelMetadata>,
     )> {
+        self.chat_completion_stream_inner(request, None).await
+    }
+
+    async fn chat_completion_stream_inner(
+        &self,
+        request: ChatCompletionRequest,
+        protected: Option<ProtectedBodyAttachment<'_>>,
+    ) -> Result<(
+        BoxStream<'static, Result<ChatCompletionChunk>>,
+        Option<ResponseModelMetadata>,
+    )> {
         let payload = self.apply_defaults(request)?;
         let x_grok_conv_id = &payload.x_grok_conv_id.clone().unwrap_or_default();
         let x_grok_req_id = &payload.x_grok_req_id.clone().unwrap_or_default();
@@ -1009,6 +1023,9 @@ impl SamplingClient {
             tracing::error!("Failed to build HTTP request: {}", e);
             SamplingError::Http(e)
         })?;
+        if let Some(protected) = protected {
+            protected.acknowledge_data_url(&built_request)?;
+        }
 
         tracing::debug!(
             url = %built_request.url(),
@@ -1304,7 +1321,19 @@ impl SamplingClient {
     #[allow(clippy::type_complexity)]
     pub async fn create_response_stream(
         &self,
+        request: CreateResponseWrapper,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+    )> {
+        self.create_response_stream_inner(request, None).await
+    }
+
+    async fn create_response_stream_inner(
+        &self,
         mut request: CreateResponseWrapper,
+        protected: Option<ProtectedBodyAttachment<'_>>,
     ) -> Result<(
         BoxStream<'static, Result<rs::ResponseStreamEvent>>,
         Option<ResponseModelMetadata>,
@@ -1380,6 +1409,9 @@ impl SamplingClient {
             tracing::error!("Failed to build HTTP request: {}", e);
             SamplingError::Http(e)
         })?;
+        if let Some(protected) = protected {
+            protected.acknowledge_data_url(&built_request)?;
+        }
 
         tracing::debug!(
             url = %built_request.url(),
@@ -1648,7 +1680,18 @@ impl SamplingClient {
     )]
     pub async fn create_message_stream(
         &self,
+        request: MessagesRequestWrapper,
+    ) -> Result<(
+        BoxStream<'static, Result<messages::MessageStreamEvent>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.create_message_stream_inner(request, None).await
+    }
+
+    async fn create_message_stream_inner(
+        &self,
         mut request: MessagesRequestWrapper,
+        protected: Option<ProtectedBodyAttachment<'_>>,
     ) -> Result<(
         BoxStream<'static, Result<messages::MessageStreamEvent>>,
         Option<ResponseModelMetadata>,
@@ -1694,6 +1737,9 @@ impl SamplingClient {
             tracing::error!("Failed to build HTTP request: {}", e);
             SamplingError::Http(e)
         })?;
+        if let Some(protected) = protected {
+            protected.acknowledge_base64(&built_request)?;
+        }
 
         tracing::debug!(
             url = %built_request.url(),
@@ -1851,12 +1897,38 @@ impl SamplingClient {
     /// Returns the stream and any model metadata extracted from response headers.
     pub async fn conversation_stream(
         &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<ChatCompletionChunk>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.conversation_stream_inner(request, None).await
+    }
+
+    pub(crate) async fn conversation_stream_protected(
+        &self,
+        request: ConversationRequest,
+        overlay: ProtectedInferenceOverlay,
+        ack: &mut ProtectedOverlayAckGuard,
+    ) -> Result<(
+        BoxStream<'static, Result<ChatCompletionChunk>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.conversation_stream_inner(request, Some((overlay, ack)))
+            .await
+    }
+
+    async fn conversation_stream_inner(
+        &self,
         mut request: ConversationRequest,
+        protected: Option<(ProtectedInferenceOverlay, &mut ProtectedOverlayAckGuard)>,
     ) -> Result<(
         BoxStream<'static, Result<ChatCompletionChunk>>,
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+
+        let protected = protected.map(|(overlay, ack)| overlay.attach_to(&mut request, ack));
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -1864,7 +1936,8 @@ impl SamplingClient {
             chat_request.trace = Some(trace);
         }
 
-        self.chat_completion_stream(chat_request).await
+        self.chat_completion_stream_inner(chat_request, protected)
+            .await
     }
 
     /// Send a conversation request using the Chat Completions API (non-streaming).
@@ -1894,13 +1967,44 @@ impl SamplingClient {
     #[allow(clippy::type_complexity)]
     pub async fn conversation_stream_responses(
         &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+    )> {
+        self.conversation_stream_responses_inner(request, None)
+            .await
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn conversation_stream_responses_protected(
+        &self,
+        request: ConversationRequest,
+        overlay: ProtectedInferenceOverlay,
+        ack: &mut ProtectedOverlayAckGuard,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+    )> {
+        self.conversation_stream_responses_inner(request, Some((overlay, ack)))
+            .await
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn conversation_stream_responses_inner(
+        &self,
         mut request: ConversationRequest,
+        protected: Option<(ProtectedInferenceOverlay, &mut ProtectedOverlayAckGuard)>,
     ) -> Result<(
         BoxStream<'static, Result<rs::ResponseStreamEvent>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+
+        let protected = protected.map(|(overlay, ack)| overlay.attach_to(&mut request, ack));
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -1927,7 +2031,7 @@ impl SamplingClient {
             wrapper.trace = Some(trace);
         }
 
-        self.create_response_stream(wrapper).await
+        self.create_response_stream_inner(wrapper, protected).await
     }
 
     /// Send a conversation request using the Responses API (non-streaming).
@@ -1967,12 +2071,38 @@ impl SamplingClient {
     /// Converts the `ConversationRequest` to Messages API format internally.
     pub async fn conversation_stream_messages(
         &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<messages::MessageStreamEvent>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.conversation_stream_messages_inner(request, None).await
+    }
+
+    pub(crate) async fn conversation_stream_messages_protected(
+        &self,
+        request: ConversationRequest,
+        overlay: ProtectedInferenceOverlay,
+        ack: &mut ProtectedOverlayAckGuard,
+    ) -> Result<(
+        BoxStream<'static, Result<messages::MessageStreamEvent>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.conversation_stream_messages_inner(request, Some((overlay, ack)))
+            .await
+    }
+
+    async fn conversation_stream_messages_inner(
+        &self,
         mut request: ConversationRequest,
+        protected: Option<(ProtectedInferenceOverlay, &mut ProtectedOverlayAckGuard)>,
     ) -> Result<(
         BoxStream<'static, Result<messages::MessageStreamEvent>>,
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+
+        let protected = protected.map(|(overlay, ack)| overlay.attach_to(&mut request, ack));
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -1994,7 +2124,7 @@ impl SamplingClient {
             wrapper.trace = Some(trace);
         }
 
-        self.create_message_stream(wrapper).await
+        self.create_message_stream_inner(wrapper, protected).await
     }
 
     /// Send a conversation request using the Anthropic Messages API (non-streaming).

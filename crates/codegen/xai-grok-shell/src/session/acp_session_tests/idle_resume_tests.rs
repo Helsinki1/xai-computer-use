@@ -163,6 +163,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 tool_context,
                 deny_read_globs: Vec::new(),
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
+                pending_computer_use_action_lease: parking_lot::Mutex::new(None),
+                computer_use_stream_tools: parking_lot::Mutex::new(Default::default()),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
                 attach_non_interactive: std::cell::Cell::new(false),

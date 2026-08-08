@@ -236,7 +236,7 @@ async fn real_exit_plan_mode_disconnect_keeps_awaiting_persisted() {
             // Disconnect must NOT auto-approve: the tool is not prepared/executed.
             match outcome {
                 Err(ToolLoop::Cancelled) => {}
-                other => panic!("expected ToolLoop::Cancelled on disconnect, got {other:?}"),
+                _ => panic!("expected ToolLoop::Cancelled on disconnect"),
             }
             assert!(
                 actor.plan_mode.lock().is_active(),

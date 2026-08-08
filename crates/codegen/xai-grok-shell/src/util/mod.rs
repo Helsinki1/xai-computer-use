@@ -1,3 +1,4 @@
+pub mod computer_use;
 pub mod config;
 pub(crate) mod dual_clock;
 pub mod grok_auth_credentials;

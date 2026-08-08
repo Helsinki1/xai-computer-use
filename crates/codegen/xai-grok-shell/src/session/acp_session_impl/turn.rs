@@ -2626,16 +2626,37 @@ impl SessionActor {
                 }
                 turn_tools_called.push(tc.name.clone());
             }
+            let protected_tool_call_flags = {
+                let state = self.mcp_state.lock().await;
+                tool_calls
+                    .iter()
+                    .map(|tc| {
+                        is_trusted_computer_use_call(&state, &tc.name, Some(tc.arguments.as_ref()))
+                    })
+                    .collect::<Vec<_>>()
+            };
             let step_signature = tool_calls
                 .iter()
-                .map(|tc| format!("{}\u{1f}{}", tc.name, tc.arguments.as_ref()))
+                .zip(&protected_tool_call_flags)
+                .map(|(tc, protected)| {
+                    let arguments = if *protected {
+                        TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS
+                    } else {
+                        tc.arguments.as_ref()
+                    };
+                    format!("{}\u{1f}{arguments}", tc.name)
+                })
                 .collect::<Vec<_>>()
                 .join("\u{1e}");
             let step_tool_name = tool_calls
                 .first()
                 .map(|tc| tc.name.clone())
                 .unwrap_or_default();
-            let is_true_noop = self.is_run_true_step(&tool_calls).await;
+            let is_true_noop = if protected_tool_call_flags.iter().any(|protected| *protected) {
+                false
+            } else {
+                self.is_run_true_step(&tool_calls).await
+            };
             identical_tool_calls.observe(&step_signature, &step_tool_name, is_true_noop);
             if is_true_noop {
                 xai_grok_telemetry::session_ctx::log_event(

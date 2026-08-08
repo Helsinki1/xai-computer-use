@@ -608,6 +608,10 @@ impl SessionActor {
         if let Some(running_task) = running_task {
             running_task.abort();
         }
+        // Abort drops the protected sampler future first; then fence off any
+        // native snapshot/lease so a cancelled model response can never be
+        // accepted or acted on later.
+        self.invalidate_computer_use_session().await;
         if let Some(is_turn_active) = &self.tool_context.is_turn_active {
             is_turn_active.store(false, std::sync::atomic::Ordering::Relaxed);
         }

@@ -23,14 +23,39 @@ pub(super) async fn dispatch_tool(
         mode = "local",
         "dispatch_tool"
     );
-    workspace_ops
-        .call_tool(
-            &prepared.tool_name,
-            prepared.parsed_args.clone(),
-            &prepared.tool_call_id.0,
-            Some(session_id),
-        )
-        .await
+    if let Some(call_id) = prepared.computer_use_call_id.clone() {
+        let mut context = xai_tool_runtime::ToolCallContext::new(call_id);
+        let workflow_id = prepared
+            .computer_use_workflow_id
+            .as_deref()
+            .ok_or_else(|| {
+                xai_tool_runtime::ToolError::custom(
+                    "computer_use_context",
+                    "trusted computer-use workflow context is missing",
+                )
+            })?;
+        xai_grok_mcp::computer_use::bind_invocation_context(&mut context, session_id, workflow_id)
+            .map_err(|error| {
+                xai_tool_runtime::ToolError::custom("computer_use_context", error.to_string())
+            })?;
+        workspace_ops
+            .call_tool_with_context(
+                &prepared.tool_name,
+                prepared.parsed_args.clone(),
+                Some(session_id),
+                context,
+            )
+            .await
+    } else {
+        workspace_ops
+            .call_tool(
+                &prepared.tool_name,
+                prepared.parsed_args.clone(),
+                &prepared.tool_call_id.0,
+                Some(session_id),
+            )
+            .await
+    }
 }
 
 /// First string-valued argument among `keys`, in priority order.

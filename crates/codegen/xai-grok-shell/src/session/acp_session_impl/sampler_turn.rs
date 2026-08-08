@@ -2,6 +2,194 @@
 //! facts/gates and retry, sampler config reconstruction, sampling-failure
 //! recovery, and per-response usage recording.
 use super::*;
+
+const COMPUTER_USE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+enum ProtectedResponseLease {
+    RetainForAction,
+    Release,
+}
+
+enum SamplerCollectionError {
+    Sampling(xai_grok_sampling_types::SamplingError),
+    Protected(acp::Error),
+}
+
+async fn computer_use_action_heartbeat_loop(
+    client: std::sync::Arc<crate::session::mcp_servers::McpClient>,
+    session_id: String,
+    workflow_id: String,
+    snapshot_id: String,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(COMPUTER_USE_HEARTBEAT_INTERVAL) => {}
+        }
+        let logical_call_id = xai_tool_protocol::ToolCallId::new_v7().to_string();
+        let invocation = match xai_grok_mcp::computer_use::ComputerUseInvocationContext::new(
+            session_id.clone(),
+            workflow_id.clone(),
+            logical_call_id.clone(),
+        ) {
+            Ok(invocation) => invocation,
+            Err(_) => {
+                failed.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        };
+        if client
+            .call_computer_use_lifecycle(
+                xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::LeaseHeartbeat {
+                    snapshot_id: snapshot_id.clone(),
+                },
+                &invocation,
+                &logical_call_id,
+            )
+            .await
+            .is_err()
+        {
+            failed.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Decide whether the delivered snapshot must remain live for one action.
+///
+/// The protected response may either contain no computer-use call (release),
+/// one standalone observation call (release before executing it), or exactly
+/// one direct effectful call bound to the delivered snapshot (retain). Mixed,
+/// tunneled, malformed, and multi-call responses are rejected before any
+/// model-produced action reaches dispatch.
+fn protected_tool_calls_lease(
+    state: &crate::session::mcp_servers::McpState,
+    calls: &[xai_grok_sampling_types::ToolCall],
+    snapshot_id: &str,
+) -> Result<ProtectedResponseLease, ()> {
+    if calls.is_empty() {
+        return Ok(ProtectedResponseLease::Release);
+    }
+    if calls.len() != 1 {
+        return Err(());
+    }
+
+    let call = &calls[0];
+    if !state.is_configured_trusted_computer_use_tool(&call.name) {
+        // Protected screenshots may drive only one direct computer-use call.
+        // Ordinary and meta-dispatch tools must never escape this turn.
+        return Err(());
+    }
+    let (_, tool_name) = crate::session::mcp_servers::parse_mcp_tool_name(&call.name).ok_or(())?;
+    match xai_grok_mcp::computer_use::classify_tool(&tool_name).ok_or(())? {
+        xai_grok_mcp::computer_use::ComputerUseToolClass::Observation => {
+            Ok(ProtectedResponseLease::Release)
+        }
+        xai_grok_mcp::computer_use::ComputerUseToolClass::Effectful => {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .ok_or(())?;
+            if arguments
+                .get("snapshot_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(snapshot_id)
+            {
+                return Err(());
+            }
+            Ok(ProtectedResponseLease::RetainForAction)
+        }
+    }
+}
+
+#[cfg(test)]
+mod protected_tool_calls_lease_tests {
+    use super::*;
+
+    fn state() -> crate::session::mcp_servers::McpState {
+        crate::session::mcp_servers::McpState::new_with_trusted_profile(
+            Vec::new(),
+            Default::default(),
+            xai_grok_mcp::computer_use::TrustedMcpProfile::ComputerUseV2,
+            std::path::PathBuf::from(
+                "/tmp/Grok Computer Use.app/Contents/MacOS/grok-computer-use-mcp",
+            ),
+        )
+        .expect("trusted test profile")
+    }
+
+    fn call(name: &str, arguments: &str) -> xai_grok_sampling_types::ToolCall {
+        xai_grok_sampling_types::ToolCall {
+            id: std::sync::Arc::from("call-1"),
+            name: name.to_string(),
+            arguments: std::sync::Arc::from(arguments),
+        }
+    }
+
+    #[test]
+    fn retains_only_one_direct_action_for_the_exact_snapshot() {
+        let state = state();
+        let calls = [call(
+            "xai_computer_use__click",
+            r#"{"snapshot_id":"snapshot-0000001","target":{"kind":"pixel","x_px":1,"y_px":2}}"#,
+        )];
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &calls, "snapshot-0000001"),
+            Ok(ProtectedResponseLease::RetainForAction)
+        ));
+        assert!(protected_tool_calls_lease(&state, &calls, "snapshot-0000002").is_err());
+    }
+
+    #[test]
+    fn releases_for_no_action_or_one_observation() {
+        let state = state();
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &[], "snapshot-0000001"),
+            Ok(ProtectedResponseLease::Release)
+        ));
+        let observation = [call(
+            "xai_computer_use__get_app_state",
+            r#"{"bundle_id":"com.example.app"}"#,
+        )];
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &observation, "snapshot-0000001"),
+            Ok(ProtectedResponseLease::Release)
+        ));
+    }
+
+    #[test]
+    fn rejects_tunneled_mixed_multiple_and_malformed_actions() {
+        let state = state();
+        let ordinary = [call("bash", r#"{"command":"echo unsafe"}"#)];
+        assert!(protected_tool_calls_lease(&state, &ordinary, "snapshot-0000001").is_err());
+
+        let tunneled = [call(
+            "use_tool",
+            r#"{"tool_name":"xai_computer_use__click","arguments":{}}"#,
+        )];
+        assert!(protected_tool_calls_lease(&state, &tunneled, "snapshot-0000001").is_err());
+
+        let action = call(
+            "xai_computer_use__scroll",
+            r#"{"snapshot_id":"snapshot-0000001","element_id":"e1","direction":"down"}"#,
+        );
+        let mixed = [action.clone(), call("read_file", r#"{"file_path":"x"}"#)];
+        assert!(protected_tool_calls_lease(&state, &mixed, "snapshot-0000001").is_err());
+        let multiple = [
+            action,
+            call(
+                "xai_computer_use__press_key",
+                r#"{"snapshot_id":"snapshot-0000001","key":"escape"}"#,
+            ),
+        ];
+        assert!(protected_tool_calls_lease(&state, &multiple, "snapshot-0000001").is_err());
+        let malformed = [call("xai_computer_use__click", "not-json")];
+        assert!(protected_tool_calls_lease(&state, &malformed, "snapshot-0000001").is_err());
+    }
+}
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
 /// `SamplingError::is_auth_error` in xai-grok-sampling-types: 403 is
@@ -110,12 +298,26 @@ where
 impl SessionActor {
     pub(super) async fn prepare_tool_definitions_timed(&self) -> (Vec<ToolDefinition>, u64) {
         let mcp_wait_start = std::time::Instant::now();
+        let trusted_computer_use_enabled = self
+            .mcp_state
+            .lock()
+            .await
+            .has_trusted_computer_use_profile();
         match self.mcp_strategy.get() {
             McpInitStrategy::Blocking => {
                 if !self.mcp_state.lock().await.is_initialized() {
                     tracing::info!(
                         "Blocking strategy: waiting for MCP initialization before first prompt..."
                     );
+                    self.wait_for_mcp_initialized().await;
+                }
+            }
+            McpInitStrategy::Progressive if trusted_computer_use_enabled => {
+                // The trusted tools cannot be tunneled through `use_tool`, so
+                // they must be registered before this turn's direct schemas
+                // are built. Enabling the profile explicitly opts into this
+                // one-time startup wait.
+                if !self.mcp_state.lock().await.is_initialized() {
                     self.wait_for_mcp_initialized().await;
                 }
             }
@@ -209,7 +411,22 @@ impl SessionActor {
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let defs = bridge.tool_definitions_builtins_only().await;
+        let mut defs = bridge.tool_definitions_builtins_only().await;
+        if self
+            .mcp_state
+            .lock()
+            .await
+            .has_trusted_computer_use_profile()
+        {
+            let all_definitions = bridge.tool_definitions().await;
+            let state = self.mcp_state.lock().await;
+            let mut trusted = all_definitions
+                .into_iter()
+                .filter(|definition| state.is_trusted_computer_use_tool(&definition.function.name))
+                .collect::<Vec<_>>();
+            trusted.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+            defs.extend(trusted);
+        }
         let plan_active = self.plan_mode.lock().is_active();
         filter_cursor_tools_by_plan_mode(defs, plan_active)
     }
@@ -1139,6 +1356,355 @@ impl SessionActor {
     ///    recovery succeeded, credentials refreshed, retry once.
     /// * `Err(acp::Error)` - terminal failure already reported via
     ///    `send_xai_notification(RetryState::Failed)`.
+    async fn call_computer_use_lifecycle(
+        &self,
+        client: &std::sync::Arc<crate::session::mcp_servers::McpClient>,
+        workflow_id: &str,
+        request: xai_grok_mcp::computer_use::ComputerUseLifecycleRequest,
+    ) -> Result<(), crate::session::mcp_servers::McpError> {
+        let logical_call_id = xai_tool_protocol::ToolCallId::new_v7().to_string();
+        let invocation = xai_grok_mcp::computer_use::ComputerUseInvocationContext::new(
+            self.session_info.id.0.to_string(),
+            workflow_id.to_string(),
+            logical_call_id.clone(),
+        )
+        .map_err(|_| {
+            crate::session::mcp_servers::McpError::ClientError(
+                "trusted computer-use lifecycle identity is invalid".to_string(),
+            )
+        })?;
+        client
+            .call_computer_use_lifecycle(request, &invocation, &logical_call_id)
+            .await
+    }
+
+    async fn invalidate_computer_use_session_for_workflow(&self, workflow_id: &str) {
+        self.stop_pending_computer_use_action_heartbeat(None).await;
+        let client = {
+            let mut state = self.mcp_state.lock().await;
+            state.invalidate_computer_use_handoff();
+            state.trusted_computer_use_client()
+        };
+        let Some(client) = client else { return };
+        if self
+            .call_computer_use_lifecycle(
+                &client,
+                workflow_id,
+                xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::InvalidateSession,
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "trusted computer-use session invalidation failed; relay state is treated as unusable"
+            );
+        }
+    }
+
+    /// Fail closed on cancellation, shutdown, or protected-delivery failure.
+    /// The native relay call is best effort, but local protected bytes are
+    /// always destroyed before this method returns.
+    pub(super) async fn invalidate_computer_use_session(&self) {
+        self.invalidate_computer_use_session_for_workflow("session-cleanup")
+            .await;
+    }
+
+    async fn fail_protected_computer_use_turn(&self, reason: &'static str) -> acp::Error {
+        let message = "Computer-use safety verification failed. The desktop operation was \
+                       invalidated; request a fresh app state before retrying."
+            .to_string();
+        tracing::warn!(reason, "protected computer-use turn failed closed");
+        self.log_terminal_failure("computer_use_integrity", None, &message);
+        self.send_xai_notification(XaiSessionUpdate::RetryState(
+            crate::extensions::notification::RetryState::Failed {
+                error_type: "computer_use_integrity".to_string(),
+                message: message.clone(),
+            },
+        ))
+        .await;
+        acp::Error::internal_error().data(crate::sampling::error::error_data_with_status(
+            message, None,
+        ))
+    }
+
+    async fn computer_use_heartbeat_until_failure(
+        &self,
+        client: &std::sync::Arc<crate::session::mcp_servers::McpClient>,
+        workflow_id: &str,
+        snapshot_id: &str,
+    ) {
+        loop {
+            tokio::time::sleep(COMPUTER_USE_HEARTBEAT_INTERVAL).await;
+            if self
+                .call_computer_use_lifecycle(
+                    client,
+                    workflow_id,
+                    xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::LeaseHeartbeat {
+                        snapshot_id: snapshot_id.to_string(),
+                    },
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    fn arm_computer_use_action_heartbeat(
+        &self,
+        client: std::sync::Arc<crate::session::mcp_servers::McpClient>,
+        workflow_id: String,
+        snapshot_id: String,
+        action_call_id: String,
+    ) -> Result<(), ()> {
+        let mut slot = self.pending_computer_use_action_lease.lock();
+        if slot.is_some() {
+            return Err(());
+        }
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::task::spawn_local(computer_use_action_heartbeat_loop(
+            client,
+            self.session_info.id.0.to_string(),
+            workflow_id,
+            snapshot_id,
+            std::sync::Arc::clone(&failed),
+            cancel.clone(),
+        ));
+        *slot = Some(crate::session::acp_session::PendingComputerUseActionLease {
+            action_call_id,
+            failed,
+            cancel,
+            task: Some(task),
+        });
+        Ok(())
+    }
+
+    /// Stop the post-inference heartbeat after permission/schema preparation.
+    /// A supplied call id must match the exact action that retained the lease.
+    pub(super) async fn stop_pending_computer_use_action_heartbeat(
+        &self,
+        action_call_id: Option<&str>,
+    ) -> bool {
+        let pending = self.pending_computer_use_action_lease.lock().take();
+        let Some(pending) = pending else { return true };
+        if action_call_id.is_some_and(|id| id != pending.action_call_id) {
+            return false;
+        }
+        pending.stop().await
+    }
+
+    async fn submit_protected_computer_use_turn(
+        self: &Arc<Self>,
+        request_id: xai_grok_sampler::RequestId,
+        request: ConversationRequest,
+        handoff: xai_grok_mcp::computer_use::ComputerUseObservationHandoff,
+        client: std::sync::Arc<crate::session::mcp_servers::McpClient>,
+    ) -> Result<
+        (
+            ConversationResponse,
+            xai_grok_sampler::InferenceLatencyStats,
+        ),
+        acp::Error,
+    > {
+        let workflow_id = handoff.workflow_id().to_string();
+        let observation = handoff.into_observation();
+        let snapshot_id = observation.snapshot_id().to_string();
+        let delivery_attestation = observation.delivery_attestation();
+        let expected_dimensions = observation.geometry().png_size_pixels();
+        let expected_sha256 = observation.png_sha256().to_string();
+
+        // Renew immediately before potentially slow request construction.
+        if self
+            .call_computer_use_lifecycle(
+                &client,
+                &workflow_id,
+                xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::LeaseHeartbeat {
+                    snapshot_id: snapshot_id.clone(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                .await;
+            return Err(self
+                .fail_protected_computer_use_turn("initial_heartbeat")
+                .await);
+        }
+
+        let (overlay_snapshot_id, text, png, sha256, width, height) =
+            observation.into_protected_parts();
+        let overlay = match self.sampler_handle.attest_protected_overlay(
+            overlay_snapshot_id,
+            text,
+            png,
+            &sha256,
+            width,
+            height,
+        ) {
+            Ok(overlay) => overlay,
+            Err(_) => {
+                self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                    .await;
+                return Err(self
+                    .fail_protected_computer_use_turn("overlay_attestation")
+                    .await);
+            }
+        };
+
+        self.computer_use_stream_tools
+            .lock()
+            .protect_request(request_id.clone());
+        let mut inference = Box::pin(
+            self.sampler_handle
+                .submit_and_collect_protected(request_id, request, overlay),
+        );
+        let mut heartbeat = Box::pin(self.computer_use_heartbeat_until_failure(
+            &client,
+            &workflow_id,
+            &snapshot_id,
+        ));
+        let collected = tokio::select! {
+            biased;
+            () = &mut heartbeat => None,
+            result = &mut inference => Some(result),
+        };
+        // On heartbeat failure, dropping this future cancels the sampler
+        // request before native session invalidation runs.
+        drop(inference);
+        drop(heartbeat);
+        let Some((ack, sampled)) = collected else {
+            self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                .await;
+            return Err(self.fail_protected_computer_use_turn("heartbeat").await);
+        };
+
+        let receipt = match ack {
+            xai_grok_sampler::ProtectedOverlayAck::Attached(receipt)
+                if receipt.matches_attestation(&snapshot_id, &expected_sha256)
+                    && receipt.pixel_dimensions() == expected_dimensions =>
+            {
+                receipt
+            }
+            _ => {
+                self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                    .await;
+                return Err(self.fail_protected_computer_use_turn("body_ack").await);
+            }
+        };
+        drop(receipt);
+
+        let (response, metrics) = match sampled {
+            Ok(completed) => completed,
+            Err(_) => {
+                self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                    .await;
+                return Err(self.fail_protected_computer_use_turn("sampling").await);
+            }
+        };
+
+        // The inference branch may win just before the next scheduled tick.
+        // Renew once synchronously so delivery attestation and response
+        // validation begin with a full native lease interval.
+        if self
+            .call_computer_use_lifecycle(
+                &client,
+                &workflow_id,
+                xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::LeaseHeartbeat {
+                    snapshot_id: snapshot_id.clone(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                .await;
+            return Err(self
+                .fail_protected_computer_use_turn("post_inference_heartbeat")
+                .await);
+        }
+
+        if self
+            .call_computer_use_lifecycle(
+                &client,
+                &workflow_id,
+                xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::AttestSnapshotDelivery(
+                    delivery_attestation,
+                ),
+            )
+            .await
+            .is_err()
+        {
+            self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                .await;
+            return Err(self
+                .fail_protected_computer_use_turn("delivery_attestation")
+                .await);
+        }
+
+        let lease = {
+            let state = self.mcp_state.lock().await;
+            protected_tool_calls_lease(&state, response.tool_calls(), &snapshot_id)
+        };
+        match lease {
+            Ok(ProtectedResponseLease::RetainForAction) => {
+                let call = &response.tool_calls()[0];
+                let bridge = self.agent.borrow().tool_bridge().clone();
+                let action_is_valid =
+                    match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                        Ok(parsed) => bridge.try_parse(&call.name, parsed).await.is_ok(),
+                        Err(_) => false,
+                    };
+                if !action_is_valid {
+                    self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                        .await;
+                    return Err(self.fail_protected_computer_use_turn("action_schema").await);
+                }
+                if self
+                    .arm_computer_use_action_heartbeat(
+                        std::sync::Arc::clone(&client),
+                        workflow_id.clone(),
+                        snapshot_id.clone(),
+                        call.id.to_string(),
+                    )
+                    .is_err()
+                {
+                    self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                        .await;
+                    return Err(self.fail_protected_computer_use_turn("action_lease").await);
+                }
+            }
+            Ok(ProtectedResponseLease::Release) => {
+                if self
+                    .call_computer_use_lifecycle(
+                        &client,
+                        &workflow_id,
+                        xai_grok_mcp::computer_use::ComputerUseLifecycleRequest::ReleaseOperation {
+                            snapshot_id,
+                        },
+                    )
+                    .await
+                    .is_err()
+                {
+                    self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                        .await;
+                    return Err(self.fail_protected_computer_use_turn("release").await);
+                }
+            }
+            Err(()) => {
+                self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                    .await;
+                return Err(self
+                    .fail_protected_computer_use_turn("response_binding")
+                    .await);
+            }
+        }
+
+        Ok((response, metrics))
+    }
+
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
@@ -1151,11 +1717,38 @@ impl SessionActor {
         };
         let request_id = xai_grok_sampler::RequestId::random();
         let request_id_str = request_id.as_str().to_string();
-        match self
-            .sampler_handle
-            .submit_and_collect(request_id, request)
-            .await
-        {
+        let (handoff, trusted_client) = {
+            let mut state = self.mcp_state.lock().await;
+            (
+                state.take_computer_use_handoff(),
+                state.trusted_computer_use_client(),
+            )
+        };
+        let collected = match handoff {
+            Some(handoff) => {
+                let workflow_id = handoff.workflow_id().to_string();
+                match trusted_client {
+                    Some(client) => self
+                        .submit_protected_computer_use_turn(request_id, request, handoff, client)
+                        .await
+                        .map_err(SamplerCollectionError::Protected),
+                    None => {
+                        self.invalidate_computer_use_session_for_workflow(&workflow_id)
+                            .await;
+                        Err(SamplerCollectionError::Protected(
+                            self.fail_protected_computer_use_turn("client_unavailable")
+                                .await,
+                        ))
+                    }
+                }
+            }
+            None => self
+                .sampler_handle
+                .submit_and_collect(request_id, request)
+                .await
+                .map_err(SamplerCollectionError::Sampling),
+        };
+        match collected {
             Ok((response, metrics)) => {
                 let span = tracing::Span::current();
                 span.record("request_id", request_id_str.as_str());
@@ -1180,7 +1773,11 @@ impl SessionActor {
                     Box::new(metrics),
                 ))
             }
-            Err(rich_err) => {
+            Err(SamplerCollectionError::Protected(error)) => {
+                self.turn_stream_drained.lock().take();
+                Err(error)
+            }
+            Err(SamplerCollectionError::Sampling(rich_err)) => {
                 self.turn_stream_drained.lock().take();
                 let info = xai_grok_sampler::SamplingErrorInfo::from(&rich_err);
                 match self.handle_sampling_failure(info).await? {
@@ -1398,8 +1995,16 @@ impl SessionActor {
             });
         }
     }
-    pub(super) async fn record_assistant_response(&self, assistant_item: ConversationItem) {
+    pub(super) async fn record_assistant_response(&self, mut assistant_item: ConversationItem) {
         self.signals_handle().record_assistant_message();
+        if let ConversationItem::Assistant(ref mut assistant) = assistant_item {
+            let state = self.mcp_state.lock().await;
+            for call in &mut assistant.tool_calls {
+                if is_trusted_computer_use_call(&state, &call.name, Some(call.arguments.as_ref())) {
+                    call.arguments = Arc::<str>::from(TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS);
+                }
+            }
+        }
         if let ConversationItem::Assistant(ref a) = assistant_item {
             tracing::info!(model_id = ?a.model_id, "DEBUG record_assistant_response model_id");
         }

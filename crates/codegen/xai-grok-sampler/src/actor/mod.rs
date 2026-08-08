@@ -101,6 +101,7 @@ impl SamplerActor {
                 request_id,
                 request,
                 config,
+                protected,
                 completion_tx,
             } => {
                 let cancel_token = CancellationToken::new();
@@ -125,6 +126,7 @@ impl SamplerActor {
                     retry_policy,
                     event_tx,
                     cancel_token,
+                    protected.map(|submission| *submission),
                     completion_tx,
                 ));
             }

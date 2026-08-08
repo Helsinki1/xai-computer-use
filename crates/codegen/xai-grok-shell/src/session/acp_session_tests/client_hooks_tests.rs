@@ -153,7 +153,7 @@ async fn pre_tool_use_resolves_meta_dispatch_tool_name_end_to_end() {
             assert!(
                 matches!(result, Err(ToolLoop::HookDenied { .. })),
                 "a hook matched on the resolved tool must gate the use_tool dispatch; \
-                 got {result:?}"
+                 got another outcome (protected payload omitted)"
             );
         })
         .await;

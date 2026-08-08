@@ -912,6 +912,24 @@ pub(crate) async fn spawn_session_actor(
     });
     let mcp_state = {
         let mut state = McpState::new_with_meta(mcp_servers.clone(), mcp_meta_config_map);
+        if !startup_hints.is_subagent && crate::util::config::computer_use_enabled() {
+            match crate::util::computer_use::trusted_relay_path() {
+                Some(relay_path) => {
+                    if let Err(error) = state.install_trusted_profile(
+                        xai_grok_mcp::computer_use::TrustedMcpProfile::ComputerUseV2,
+                        relay_path,
+                    ) {
+                        tracing::warn!(
+                            error = %error,
+                            "computer use is enabled but the trusted profile could not be installed"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    "computer use is enabled but the signed native relay is unavailable"
+                ),
+            }
+        }
         if let Some(ref pool) = parent_mcp_pool {
             state.import_shared_clients(pool);
             tracing::info!(
@@ -1567,6 +1585,7 @@ pub(crate) async fn spawn_session_actor(
         tool_context,
         deny_read_globs,
         mcp_state: mcp_state.clone(),
+        pending_computer_use_action_lease: parking_lot::Mutex::new(None),
         mcp_strategy: std::cell::Cell::new(mcp_strategy),
         initial_client_mcp_servers: initial_client_mcp_servers.clone(),
         chat_state_handle,
@@ -1764,6 +1783,9 @@ pub(crate) async fn spawn_session_actor(
         turn_summary_enabled: effective_config.is_turn_summary_enabled(),
         session_turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
+        computer_use_stream_tools: parking_lot::Mutex::new(
+            super::tool_calls::ComputerUseStreamTracker::default(),
+        ),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle,
         rebuild_spec: rebuild_spec.clone(),

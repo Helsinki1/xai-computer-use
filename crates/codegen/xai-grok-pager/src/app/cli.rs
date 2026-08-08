@@ -46,6 +46,9 @@ pub enum Command {
     },
     /// Manage MCP server configurations
     Mcp(crate::mcp_cmd::McpArgs),
+    /// Manage the native Computer Use service
+    #[command(name = "computer-use")]
+    ComputerUse(crate::computer_use_cmd::ComputerUseArgs),
     /// Manage plugins and marketplace sources
     Plugin(crate::plugin_cmd::PluginArgs),
     /// Manage cross-session memory

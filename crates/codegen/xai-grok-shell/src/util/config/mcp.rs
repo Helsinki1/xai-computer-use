@@ -25,6 +25,9 @@ pub use xai_grok_config_types::{
 pub use xai_grok_config_types::{McpConfig, RelaySyncConfig};
 // Worktree-pool config value type extracted; re-exported to keep paths stable.
 pub use xai_grok_config_types::PoolConfig;
+pub use xai_grok_mcp::computer_use::{
+    COMPUTER_USE_MCP_SERVER_NAME, is_reserved_server_name as is_reserved_computer_use_server_name,
+};
 
 /// TUI/CLI settings. Composed from typed section configs defined in `agent::config`.
 #[derive(Debug, Clone, Default)]
@@ -158,6 +161,9 @@ pub(crate) fn load_mcp_servers_with_oauth(
     let preferences = load_mcp_preferences().file();
     let sub = &crate::config::expand_env_vars_in_string;
     for (name, config) in servers_map {
+        if is_reserved_computer_use_server_name(&name) {
+            continue;
+        }
         let mut config = match config.resolve_setup(preferences.servers.get(&name)) {
             McpSetupResolution::Resolved(config) => config,
             McpSetupResolution::Required(_) => continue,
@@ -245,6 +251,9 @@ pub(crate) fn materialize_mcp_config(
     sub: &dyn Fn(&str) -> String,
     enabled_filter: McpEnabledFilter,
 ) -> Option<acp::McpServer> {
+    if is_reserved_computer_use_server_name(name) {
+        return None;
+    }
     if matches!(enabled_filter, McpEnabledFilter::Ignore) {
         config.enabled = true;
     }
@@ -327,6 +336,9 @@ pub(crate) fn reload_mcp_servers_merged(
     servers
         .into_iter()
         .filter_map(|(name, config)| {
+            if is_reserved_computer_use_server_name(&name) {
+                return None;
+            }
             let mut config = match config.resolve_setup(preferences.servers.get(&name)) {
                 McpSetupResolution::Resolved(config) => config,
                 McpSetupResolution::Required(_) => return None,
@@ -1216,10 +1228,14 @@ pub(crate) fn parse_mcp_servers_with_problems(root: &TomlValue) -> ParsedMcpServ
 
 /// Wrapper that logs problems and returns only the valid servers.
 pub(crate) fn parse_mcp_servers_from_toml(root: &TomlValue) -> IndexMap<String, McpServerConfig> {
-    let ParsedMcpServers { servers, problems } = parse_mcp_servers_with_problems(root);
+    let ParsedMcpServers {
+        mut servers,
+        problems,
+    } = parse_mcp_servers_with_problems(root);
     for problem in &problems {
         tracing::warn!(server = %problem.server, "{}", problem.message);
     }
+    servers.retain(|name, _| !is_reserved_computer_use_server_name(name));
     servers
 }
 
@@ -1269,6 +1285,9 @@ pub(crate) fn load_mcp_json_servers_as_configs_unfiltered(
     for mcp_path in mcp_json_files.iter().rev() {
         if let Some(config) = read_mcp_json(mcp_path) {
             for (name, cfg) in config.mcp_servers {
+                if is_reserved_computer_use_server_name(&name) {
+                    continue;
+                }
                 result.entry(name).or_insert(cfg);
             }
         }
@@ -1294,6 +1313,9 @@ pub(crate) fn parse_mcp_config_with_oauth(
     let mut servers = Vec::new();
     let mut oauth_configs = McpOAuthConfigMap::new();
     for (name, server_config) in &config.mcp_servers {
+        if is_reserved_computer_use_server_name(name) {
+            continue;
+        }
         let mut server_config = match server_config.resolve_setup(preferences.servers.get(name)) {
             McpSetupResolution::Resolved(config) => config,
             McpSetupResolution::Required(_) => continue,
@@ -1439,12 +1461,18 @@ fn load_claude_json_mcp_servers_from_as_configs(
     let cwd_key = cwd.to_string_lossy();
     if let Some(project) = config.projects.get(cwd_key.as_ref()) {
         for (name, cfg) in &project.mcp_servers {
+            if is_reserved_computer_use_server_name(name) {
+                continue;
+            }
             result.insert(name.clone(), cfg.clone());
         }
     }
 
     // User-level MCP servers (lower priority)
     for (name, cfg) in &config.user_mcp.mcp_servers {
+        if is_reserved_computer_use_server_name(name) {
+            continue;
+        }
         result.entry(name.clone()).or_insert(cfg.clone());
     }
     tracing::info!(
@@ -1531,6 +1559,9 @@ pub(crate) fn load_cursor_mcp_servers_as_configs(
         && let Some(config) = read_mcp_json(&project_path)
     {
         for (name, cfg) in config.mcp_servers {
+            if is_reserved_computer_use_server_name(&name) {
+                continue;
+            }
             result.insert(name, cfg);
         }
     }
@@ -1542,6 +1573,9 @@ pub(crate) fn load_cursor_mcp_servers_as_configs(
             && let Some(config) = read_mcp_json(&global_path)
         {
             for (name, cfg) in config.mcp_servers {
+                if is_reserved_computer_use_server_name(&name) {
+                    continue;
+                }
                 result.entry(name).or_insert(cfg);
             }
         }
@@ -1788,6 +1822,45 @@ pub fn user_config_path() -> PathBuf {
     config_path()
 }
 
+/// Whether the reserved native computer-use profile is enabled by effective
+/// user/managed policy. It is deliberately separate from generic MCP enable
+/// lists so an MCP config entry cannot turn the privileged profile on.
+pub fn computer_use_enabled() -> bool {
+    xai_grok_config::ConfigLayers::load()
+        .ok()
+        .is_some_and(|layers| computer_use_enabled_from_layers(&layers))
+}
+
+fn computer_use_enabled_from_layers(layers: &xai_grok_config::ConfigLayers) -> bool {
+    // Campaigns are full-power patches, including remote campaigns. A remote
+    // nudge must never mint this local privileged capability, so resolve only
+    // the ordinary user/managed/requirements authority layers here.
+    computer_use_enabled_in(&layers.effective_config_base()).unwrap_or(false)
+}
+
+fn computer_use_enabled_in(root: &TomlValue) -> Option<bool> {
+    root.get("computer_use")?.get("enabled")?.as_bool()
+}
+
+/// Persist the local computer-use policy without creating a forgeable
+/// `[mcp_servers.xai_computer_use]` entry.
+pub async fn save_computer_use_enabled(enabled: bool) -> Result<()> {
+    write_toml_table_if_changed(&config_path(), |root| {
+        let section = root
+            .entry("computer_use".to_string())
+            .or_insert_with(|| TomlValue::Table(TomlMap::new()));
+        if !section.is_table() {
+            *section = TomlValue::Table(TomlMap::new());
+        }
+        section
+            .as_table_mut()
+            .expect("computer_use was normalized to a table")
+            .insert("enabled".to_string(), TomlValue::Boolean(enabled));
+    })
+    .await
+    .map(|_| ())
+}
+
 /// Path to a project-level config file (`<dir>/.grok/config.toml`).
 pub fn project_config_path(dir: &std::path::Path) -> PathBuf {
     dir.join(".grok").join("config.toml")
@@ -1915,6 +1988,42 @@ pub(crate) fn session_registry_local_override(root: Option<&TomlValue>) -> Optio
 mod tests {
     use super::*;
     use toml::Value as TomlValue;
+
+    #[test]
+    fn computer_use_policy_is_separate_and_default_off() {
+        let enabled: TomlValue = toml::from_str("[computer_use]\nenabled = true\n").unwrap();
+        let disabled: TomlValue = toml::from_str("[computer_use]\nenabled = false\n").unwrap();
+        let generic_mcp: TomlValue =
+            toml::from_str("[mcp_servers.xai_computer_use]\ncommand = \"forged\"\n").unwrap();
+
+        assert_eq!(computer_use_enabled_in(&enabled), Some(true));
+        assert_eq!(computer_use_enabled_in(&disabled), Some(false));
+        assert_eq!(computer_use_enabled_in(&generic_mcp), None);
+        assert!(parse_mcp_servers_from_toml(&generic_mcp).is_empty());
+        assert_eq!(
+            computer_use_enabled_in(&TomlValue::Table(TomlMap::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_campaign_cannot_enable_computer_use() {
+        let disabled: TomlValue = toml::from_str("[computer_use]\nenabled = false\n").unwrap();
+        let campaign_value: TomlValue = toml::from_str("[computer_use]\nenabled = true\n").unwrap();
+        let campaign = xai_grok_config::CampaignEntry {
+            id: "remote-computer-use".to_string(),
+            patch: campaign_value.as_table().unwrap().clone(),
+        };
+        let layers = xai_grok_config::ConfigLayers {
+            user: disabled,
+            ..Default::default()
+        };
+
+        let campaign_effective =
+            layers.effective_config_with_campaigns(&[campaign], &std::collections::HashSet::new());
+        assert_eq!(computer_use_enabled_in(&campaign_effective), Some(true));
+        assert!(!computer_use_enabled_from_layers(&layers));
+    }
 
     /// Env beats config.toml; unrecognized env defers; both absent defers to remote.
     #[test]

@@ -552,8 +552,45 @@ mod managed_gateway_error_tests {
         );
     }
 }
+const TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS: &str = r#"{"redacted":"trusted_computer_use"}"#;
+
+fn trusted_computer_use_redacted_input() -> serde_json::Value {
+    serde_json::json!({"redacted": "trusted_computer_use"})
+}
+
+fn is_mcp_meta_dispatch_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "use_tool" | "UseTool" | "CallMcpTool" | "call_mcp_tool"
+    )
+}
+
+/// Decide from capability-bearing MCP state, never from the reserved name
+/// alone. Invalid meta-dispatch arguments are redacted conservatively while
+/// the profile is active because their intended target cannot be proven safe.
+fn is_trusted_computer_use_call(
+    state: &crate::session::mcp_servers::McpState,
+    tool_name: &str,
+    raw_arguments: Option<&str>,
+) -> bool {
+    if state.is_configured_trusted_computer_use_tool(tool_name) {
+        return true;
+    }
+    if !state.has_trusted_computer_use_profile() || !is_mcp_meta_dispatch_tool(tool_name) {
+        return false;
+    }
+    let target = raw_arguments
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("tool_name")?.as_str().map(str::to_owned));
+    target
+        .as_deref()
+        .is_none_or(|target| state.is_configured_trusted_computer_use_tool(target))
+}
+
 /// Data carried from prepare_tool_call → dispatch_tool → finalize.
-#[derive(Debug, Clone)]
+///
+/// Deliberately not `Debug`: protected parsed arguments exist only until the
+/// immediate dispatch completes and must not be formatter-accessible.
 pub(crate) struct PreparedToolCall {
     /// The model's tool call ID (for tool_result matching).
     call_id: String,
@@ -574,6 +611,10 @@ pub(crate) struct PreparedToolCall {
     dispatch_target_name: Option<String>,
     /// Read-only per `ToolKind`; decides whether the call takes the per-file lock.
     is_read_only: bool,
+    /// Host-minted runtime call id for a trusted computer-use invocation.
+    computer_use_call_id: Option<xai_tool_protocol::ToolCallId>,
+    /// Host workflow scope bound into the trusted MCP request metadata.
+    computer_use_workflow_id: Option<String>,
 }
 impl PreparedToolCall {
     /// The tool name hooks see: the resolved dispatch target, else the wire name.
@@ -583,6 +624,27 @@ impl PreparedToolCall {
         self.dispatch_target_name
             .as_deref()
             .unwrap_or(&self.tool_name)
+    }
+
+    pub(crate) fn is_trusted_computer_use(&self) -> bool {
+        self.computer_use_call_id.is_some()
+    }
+
+    pub(crate) fn computer_use_handoff_identity(
+        &self,
+    ) -> Option<(&xai_tool_protocol::ToolCallId, &str)> {
+        Some((
+            self.computer_use_call_id.as_ref()?,
+            self.computer_use_workflow_id.as_deref()?,
+        ))
+    }
+
+    /// Destroy model-supplied protected arguments as soon as dispatch returns.
+    /// Post-flight code only receives the fixed marker.
+    pub(crate) fn redact_computer_use_arguments_after_dispatch(&mut self) {
+        if self.is_trusted_computer_use() {
+            self.parsed_args = trusted_computer_use_redacted_input();
+        }
     }
 }
 #[cfg(test)]
@@ -595,6 +657,32 @@ pub(crate) struct ModelAuthMemo {
     pub(crate) model_id: String,
     pub(crate) facts: crate::agent::config::ModelAuthFacts,
     pub(crate) provider: Option<crate::auth::AuthProviderRef>,
+}
+
+pub(crate) struct PendingComputerUseActionLease {
+    pub(crate) action_call_id: String,
+    pub(crate) failed: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
+    pub(crate) task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PendingComputerUseActionLease {
+    pub(crate) async fn stop(mut self) -> bool {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        !self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for PendingComputerUseActionLease {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 /// Phase 3: Post-flight handling after dispatch (inline in execute_tool_calls for now).
 pub(crate) struct SessionActor {
@@ -647,6 +735,10 @@ pub(crate) struct SessionActor {
     /// Consolidated MCP state (configs, clients, init status) protected by a single lock.
     /// This ensures atomicity when updating configs or checking initialization status.
     pub(crate) mcp_state: Arc<TokioMutex<McpState>>,
+    /// Heartbeat kept alive after protected inference while the one approved
+    /// desktop action waits in schema/permission preparation.
+    pub(crate) pending_computer_use_action_lease:
+        parking_lot::Mutex<Option<PendingComputerUseActionLease>>,
     /// MCP initialization strategy. `Cell`: per-attachment policy — a
     /// resident `session/load` carrying explicit `startupHints` re-applies
     /// the attaching client's strategy (`UpdateAttachPolicy`), so a headless
@@ -1040,6 +1132,10 @@ pub(crate) struct SessionActor {
     /// A `tracing::warn!` tripwire in the handler logs every occurrence so
     /// we can quantify the loss in production before investing in a stash.
     pub(crate) streaming_turn_capture: parking_lot::Mutex<StreamingTurnCapture>,
+    /// Request/tool-index classification for streaming argument redaction.
+    /// Unknown tool identities are buffered until they can be proven ordinary;
+    /// trusted computer-use argument fragments never reach UI updates.
+    pub(crate) computer_use_stream_tools: parking_lot::Mutex<tool_calls::ComputerUseStreamTracker>,
     /// Per-turn barrier that orders the streamed message against the turn's
     /// tool calls.
     ///

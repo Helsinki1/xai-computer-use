@@ -8,6 +8,256 @@
 use super::*;
 use futures::StreamExt;
 use tracing::Instrument;
+
+#[derive(Default)]
+pub(crate) struct ComputerUseStreamTracker {
+    calls:
+        std::collections::HashMap<(xai_grok_sampler::RequestId, u32), ComputerUseStreamCallState>,
+    protected_requests: std::collections::HashSet<xai_grok_sampler::RequestId>,
+}
+
+enum ComputerUseStreamCallState {
+    Pending(Vec<BufferedToolCallDelta>),
+    Ordinary,
+    Trusted,
+}
+
+struct BufferedToolCallDelta {
+    id: Option<String>,
+    name: Option<String>,
+    arguments_delta: Option<String>,
+}
+
+impl ComputerUseStreamTracker {
+    pub(super) fn protect_request(&mut self, request_id: xai_grok_sampler::RequestId) {
+        self.protected_requests.insert(request_id);
+    }
+
+    fn restart_request(&mut self, request_id: &xai_grok_sampler::RequestId) {
+        self.calls.retain(|(id, _), _| id != request_id);
+    }
+
+    fn clear_request(&mut self, request_id: &xai_grok_sampler::RequestId) {
+        self.restart_request(request_id);
+        self.protected_requests.remove(request_id);
+    }
+
+    /// Buffer name-less deltas until the tool identity is known. Ordinary
+    /// calls are then replayed unchanged; trusted calls retain only their
+    /// non-sensitive id/name envelope.
+    fn filter_delta(
+        &mut self,
+        request_id: xai_grok_sampler::RequestId,
+        tool_index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: Option<String>,
+        named_tool_is_trusted: Option<bool>,
+    ) -> Vec<BufferedToolCallDelta> {
+        if self.protected_requests.contains(&request_id) {
+            return vec![BufferedToolCallDelta {
+                id,
+                name,
+                arguments_delta: None,
+            }];
+        }
+        let key = (request_id, tool_index);
+        let current = BufferedToolCallDelta {
+            id,
+            name,
+            arguments_delta,
+        };
+        match named_tool_is_trusted {
+            Some(true) => {
+                let prior = self.calls.remove(&key);
+                self.calls.insert(key, ComputerUseStreamCallState::Trusted);
+                let mut output = match prior {
+                    Some(ComputerUseStreamCallState::Pending(pending)) => pending,
+                    _ => Vec::new(),
+                };
+                output.push(current);
+                for delta in &mut output {
+                    delta.arguments_delta = None;
+                }
+                output
+            }
+            Some(false) => match self.calls.remove(&key) {
+                Some(ComputerUseStreamCallState::Trusted) => {
+                    self.calls.insert(key, ComputerUseStreamCallState::Trusted);
+                    vec![BufferedToolCallDelta {
+                        arguments_delta: None,
+                        ..current
+                    }]
+                }
+                Some(ComputerUseStreamCallState::Pending(mut pending)) => {
+                    self.calls.insert(key, ComputerUseStreamCallState::Ordinary);
+                    pending.push(current);
+                    pending
+                }
+                _ => {
+                    self.calls.insert(key, ComputerUseStreamCallState::Ordinary);
+                    vec![current]
+                }
+            },
+            None => match self.calls.get_mut(&key) {
+                Some(ComputerUseStreamCallState::Ordinary) => vec![current],
+                Some(ComputerUseStreamCallState::Trusted) => vec![BufferedToolCallDelta {
+                    arguments_delta: None,
+                    ..current
+                }],
+                Some(ComputerUseStreamCallState::Pending(pending)) => {
+                    pending.push(current);
+                    Vec::new()
+                }
+                None => {
+                    self.calls
+                        .insert(key, ComputerUseStreamCallState::Pending(vec![current]));
+                    Vec::new()
+                }
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod computer_use_stream_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn interleaved_ordinary_and_trusted_deltas_keep_only_ordinary_arguments() {
+        let mut tracker = ComputerUseStreamTracker::default();
+        let request_id = xai_grok_sampler::RequestId::from("request-1");
+
+        let ordinary = tracker.filter_delta(
+            request_id.clone(),
+            0,
+            Some("ordinary-id".to_string()),
+            Some("read_file".to_string()),
+            Some(r#"{"file_path":"a"}"#.to_string()),
+            Some(false),
+        );
+        assert_eq!(ordinary.len(), 1);
+        assert!(ordinary[0].arguments_delta.is_some());
+
+        let trusted = tracker.filter_delta(
+            request_id.clone(),
+            1,
+            Some("trusted-id".to_string()),
+            Some("xai_computer_use__click".to_string()),
+            Some(r#"{"snapshot_id":"private"}"#.to_string()),
+            Some(true),
+        );
+        assert_eq!(trusted.len(), 1);
+        assert!(trusted[0].arguments_delta.is_none());
+
+        let ordinary_tail =
+            tracker.filter_delta(request_id, 0, None, None, Some("}".to_string()), None);
+        assert_eq!(ordinary_tail[0].arguments_delta.as_deref(), Some("}"));
+    }
+
+    #[test]
+    fn name_less_deltas_are_buffered_until_classified() {
+        let mut tracker = ComputerUseStreamTracker::default();
+        let request_id = xai_grok_sampler::RequestId::from("request-2");
+        assert!(
+            tracker
+                .filter_delta(
+                    request_id.clone(),
+                    0,
+                    Some("call-id".to_string()),
+                    None,
+                    Some("secret".to_string()),
+                    None,
+                )
+                .is_empty()
+        );
+        let output = tracker.filter_delta(
+            request_id,
+            0,
+            None,
+            Some("xai_computer_use__type_text".to_string()),
+            None,
+            Some(true),
+        );
+        assert_eq!(output.len(), 2);
+        assert!(output.iter().all(|delta| delta.arguments_delta.is_none()));
+    }
+
+    #[test]
+    fn protected_request_redacts_even_an_ordinary_or_tunneled_tool() {
+        let mut tracker = ComputerUseStreamTracker::default();
+        let request_id = xai_grok_sampler::RequestId::from("request-3");
+        tracker.protect_request(request_id.clone());
+        let output = tracker.filter_delta(
+            request_id,
+            0,
+            Some("call-id".to_string()),
+            Some("use_tool".to_string()),
+            Some(r#"{"tool_name":"xai_computer_use__click"}"#.to_string()),
+            Some(false),
+        );
+        assert_eq!(output.len(), 1);
+        assert!(output[0].arguments_delta.is_none());
+    }
+}
+
+fn trusted_computer_use_batch_mask(
+    state: &crate::session::mcp_servers::McpState,
+    tool_calls: &[crate::sampling::types::ToolCallResponse],
+) -> Vec<bool> {
+    tool_calls
+        .iter()
+        .map(|call| {
+            is_trusted_computer_use_call(state, &call.function.name, Some(&call.function.arguments))
+                && !is_mcp_meta_dispatch_tool(&call.function.name)
+        })
+        .collect()
+}
+
+fn rejects_trusted_computer_use_batch(mask: &[bool]) -> bool {
+    mask.len() > 1 && mask.iter().any(|&trusted| trusted)
+}
+
+fn protected_handoff_identity<'a>(
+    prepared: &'a PreparedToolCall,
+    result: &ToolRunResult,
+) -> Option<(&'a xai_tool_protocol::ToolCallId, &'a str)> {
+    if result.output.is_error()
+        || result.prompt_text != xai_grok_mcp::computer_use::COMPUTER_USE_OBSERVATION_PLACEHOLDER
+    {
+        return None;
+    }
+    prepared.computer_use_handoff_identity()
+}
+
+fn trusted_computer_use_result_requires_invalidation(
+    prepared: &PreparedToolCall,
+    result: &Result<ToolRunResult, xai_tool_runtime::ToolError>,
+    has_protected_handoff: bool,
+) -> bool {
+    if !prepared.is_trusted_computer_use() {
+        return false;
+    }
+    let Ok(tool_result) = result else {
+        return true;
+    };
+    if tool_result.output.is_error() {
+        return true;
+    }
+    let Some((_, tool_name)) =
+        crate::session::mcp_servers::parse_mcp_tool_name(&prepared.tool_name)
+    else {
+        return true;
+    };
+    match xai_grok_mcp::computer_use::classify_tool(&tool_name) {
+        Some(xai_grok_mcp::computer_use::ComputerUseToolClass::Effectful) => !has_protected_handoff,
+        Some(xai_grok_mcp::computer_use::ComputerUseToolClass::Observation) => {
+            tool_name != "list_apps" && !has_protected_handoff
+        }
+        None => true,
+    }
+}
+
 /// Whether a tool name is an MCP `create_pull_request` (qualified
 /// `server__create_pull_request` or bare).
 fn is_mcp_create_pull_request(tool_name: &str) -> bool {
@@ -359,22 +609,44 @@ impl SessionActor {
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
             tracing::Span::current().record("model_id", cfg.model.as_str());
         }
+        let reject_batched_trusted_calls = {
+            let state = self.mcp_state.lock().await;
+            rejects_trusted_computer_use_batch(&trusted_computer_use_batch_mask(
+                &state,
+                &tool_calls,
+            ))
+        };
         let mut final_result: Option<ToolLoop> = None;
         let mut deferred_followups: Vec<ConversationItem> = Vec::new();
         if tool_calls.len() > 1 {
             let kind_of = |name: &str| self.agent.borrow().tool_bridge().tool_kind(name);
             let (body, tail) = split_exit_plan_tail(tool_calls, kind_of);
             if !body.is_empty() {
-                self.execute_tool_calls_batch(body, &mut deferred_followups, &mut final_result)
-                    .await?;
+                self.execute_tool_calls_batch(
+                    body,
+                    reject_batched_trusted_calls,
+                    &mut deferred_followups,
+                    &mut final_result,
+                )
+                .await?;
             }
             if !tail.is_empty() {
-                self.execute_tool_calls_batch(tail, &mut deferred_followups, &mut final_result)
-                    .await?;
+                self.execute_tool_calls_batch(
+                    tail,
+                    reject_batched_trusted_calls,
+                    &mut deferred_followups,
+                    &mut final_result,
+                )
+                .await?;
             }
         } else {
-            self.execute_tool_calls_batch(tool_calls, &mut deferred_followups, &mut final_result)
-                .await?;
+            self.execute_tool_calls_batch(
+                tool_calls,
+                reject_batched_trusted_calls,
+                &mut deferred_followups,
+                &mut final_result,
+            )
+            .await?;
         }
         {
             let _span = if !deferred_followups.is_empty() {
@@ -403,12 +675,24 @@ impl SessionActor {
     async fn execute_tool_calls_batch(
         &self,
         tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
+        reject_batched_trusted_calls: bool,
         deferred_followups: &mut Vec<ConversationItem>,
         final_result: &mut Option<ToolLoop>,
     ) -> Result<(), acp::Error> {
+        let trusted_call_mask = {
+            let state = self.mcp_state.lock().await;
+            trusted_computer_use_batch_mask(&state, &tool_calls)
+        };
+        let reject_trusted_batch =
+            reject_batched_trusted_calls || rejects_trusted_computer_use_batch(&trusted_call_mask);
         let mut approved: Vec<PreparedToolCall> = Vec::new();
-        for call in tool_calls.into_iter() {
+        let mut trusted_session_invalidated = false;
+        for (call, is_trusted_call) in tool_calls.into_iter().zip(trusted_call_mask) {
             if final_result.is_some() {
+                if is_trusted_call && !trusted_session_invalidated {
+                    self.invalidate_computer_use_session().await;
+                    trusted_session_invalidated = true;
+                }
                 let message = match &*final_result {
                     Some(ToolLoop::PermissionReject { .. }) => {
                         format!(
@@ -448,10 +732,64 @@ impl SessionActor {
                     },
                 )
                 .await;
+            if reject_trusted_batch && is_trusted_call {
+                if !trusted_session_invalidated {
+                    self.invalidate_computer_use_session().await;
+                    trusted_session_invalidated = true;
+                }
+                let tool_call_id = acp::ToolCallId::new(Arc::from(call.id.clone()));
+                self.send_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), call.function.name.clone())
+                            .kind(acp::ToolKind::Other)
+                            .status(acp::ToolCallStatus::Pending)
+                            .meta(self.stamp_tool_meta(None, &call.function.name, None)),
+                    ),
+                    None,
+                )
+                .await;
+                self.handle_tool_not_executed(
+                    &call.id,
+                    &tool_call_id,
+                    "Trusted computer-use calls cannot be batched; issue exactly one per model turn."
+                        .to_string(),
+                )
+                .await?;
+                self.events.tool_finished();
+                if let Some((server, tool)) =
+                    crate::session::mcp_servers::parse_mcp_tool_name(&call.function.name)
+                {
+                    self.emit_event(xai_file_utils::events::Event::McpToolCallCompleted {
+                        server_name: server.to_string(),
+                        tool_name: tool.to_string(),
+                        call_id: call.function.name.clone(),
+                        duration_ms: 0,
+                        success: false,
+                        is_timeout: false,
+                        error: Some("batched_trusted_computer_use_call".to_string()),
+                        reconnect_attempted: false,
+                        auth_retry_attempted: false,
+                    });
+                }
+                continue;
+            }
             let call_name = call.function.name.clone();
-            match self.prepare_tool_call(call, deferred_followups).await? {
+            let prepared_result = match self.prepare_tool_call(call, deferred_followups).await {
+                Ok(result) => result,
+                Err(error) => {
+                    if is_trusted_call && !trusted_session_invalidated {
+                        self.invalidate_computer_use_session().await;
+                    }
+                    return Err(error);
+                }
+            };
+            match prepared_result {
                 Ok(prepared) => approved.push(prepared),
                 Err(tool_loop) => {
+                    if is_trusted_call && !trusted_session_invalidated {
+                        self.invalidate_computer_use_session().await;
+                        trusted_session_invalidated = true;
+                    }
                     self.events.tool_finished();
                     if let Some((server, tool)) =
                         crate::session::mcp_servers::parse_mcp_tool_name(&call_name)
@@ -519,11 +857,17 @@ impl SessionActor {
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
-        let dispatch_futures: Vec<_> = approved
+        let serialize_dispatch = approved
             .iter()
+            .any(PreparedToolCall::is_trusted_computer_use);
+        let dispatch_futures: Vec<_> = approved
+            .into_iter()
             .enumerate()
             .map(|(idx, prepared)| {
-                let prepared = Arc::new(prepared.clone());
+                // Move the only argument-bearing PreparedToolCall into the
+                // dispatch future. Arc clones below share that allocation for
+                // retry attempts; no second copy remains in a post-flight slot.
+                let prepared = Arc::new(prepared);
                 let am = self.auth_manager.clone();
                 let shared_recovery = Arc::clone(&shared_recovery);
                 let workspace_ops = workspace_ops.clone();
@@ -559,7 +903,11 @@ impl SessionActor {
                             dispatch_tool(&workspace_ops, &prepared, &session_id).await
                         }
                     };
-                    let result = if interruptible {
+                    let result = if prepared.is_trusted_computer_use() {
+                        // Protected calls are single-attempt. In particular, never
+                        // replay an effect after an auth or transport ambiguity.
+                        run_tool().instrument(tool_span).await
+                    } else if interruptible {
                         let _wait_guard = BlockingWaitGuard::enter(blocking_wait_depth.clone());
                         async {
                             tokio::select! {
@@ -603,21 +951,31 @@ impl SessionActor {
                             "success": success,
                         })),
                     );
-                    (idx, result, duration_ms)
+                    let mut prepared = match Arc::try_unwrap(prepared) {
+                        Ok(prepared) => prepared,
+                        Err(_) => unreachable!("dispatch attempt retained PreparedToolCall"),
+                    };
+                    prepared.redact_computer_use_arguments_after_dispatch();
+                    (idx, result, duration_ms, prepared)
                 }
             })
             .collect();
         tokio::task::yield_now().await;
-        let mut dispatch_stream = futures::stream::FuturesUnordered::new();
-        for fut in dispatch_futures {
-            dispatch_stream.push(fut);
-        }
-        let mut approved_slots: Vec<Option<PreparedToolCall>> =
-            approved.into_iter().map(Some).collect();
+        // A batch containing computer use is ordered exactly as the model
+        // emitted it. This prevents concurrent GUI effects and prevents an
+        // ordinary tool from racing a snapshot-bearing action in the batch.
+        let dispatch_concurrency = if serialize_dispatch {
+            1
+        } else {
+            dispatch_futures.len().max(1)
+        };
+        let mut dispatch_stream =
+            futures::stream::iter(dispatch_futures).buffer_unordered(dispatch_concurrency);
         let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<(
             usize,
             Result<ToolRunResult, xai_tool_runtime::ToolError>,
             u64,
+            PreparedToolCall,
         )>();
         let drainer = tokio::spawn(
             async move {
@@ -630,10 +988,7 @@ impl SessionActor {
             .in_current_span(),
         );
         let _drainer_guard = crate::util::AbortOnDrop(drainer);
-        while let Some((idx, mut result, mut duration_ms)) = dispatch_rx.recv().await {
-            let prepared = approved_slots[idx]
-                .take()
-                .expect("dispatch index should match an approved slot exactly once");
+        while let Some((idx, mut result, mut duration_ms, prepared)) = dispatch_rx.recv().await {
             self.signals_handle().record_tool_call(&prepared.tool_name);
             let tool_call_id = if prepared.call_id.is_empty() {
                 tracing::warn!(
@@ -650,9 +1005,43 @@ impl SessionActor {
                 tool_call_id.clone(),
                 duration_ms,
             );
+            let handoff_identity = result
+                .as_ref()
+                .ok()
+                .and_then(|tool_result| protected_handoff_identity(&prepared, tool_result))
+                .map(|(call_id, workflow_id)| {
+                    (call_id.as_str().to_string(), workflow_id.to_string())
+                });
+            let has_protected_handoff = handoff_identity.is_some();
+            if let Some((logical_call_id, workflow_id)) = handoff_identity {
+                let arm_error = {
+                    let mut state = self.mcp_state.lock().await;
+                    match state.arm_computer_use_handoff(&logical_call_id, &workflow_id) {
+                        Ok(()) => None,
+                        Err(error) => Some(error),
+                    }
+                };
+                if let Some(error) = arm_error {
+                    result = Err(xai_tool_runtime::ToolError::custom(
+                        "computer_use_handoff",
+                        error.to_string(),
+                    ));
+                }
+            }
+            if trusted_computer_use_result_requires_invalidation(
+                &prepared,
+                &result,
+                has_protected_handoff,
+            ) {
+                // An effect may already have been applied when transport or
+                // snapshot recovery fails. Fence the native lease and destroy
+                // all local protected bytes before another inference starts.
+                self.invalidate_computer_use_session().await;
+            }
             let mut post_tool_use_result: Option<serde_json::Value> = None;
-            if let Some((server, _)) =
-                crate::session::mcp_servers::parse_mcp_tool_name(&prepared.tool_name)
+            if !prepared.is_trusted_computer_use()
+                && let Some((server, _)) =
+                    crate::session::mcp_servers::parse_mcp_tool_name(&prepared.tool_name)
                 && server.starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
             {
                 let auth_rejected = match &result {
@@ -703,13 +1092,13 @@ impl SessionActor {
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
                     let drained = DrainedToolSuccess::new(tool_result);
-                    post_tool_use_result = self
-                        .hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUse)
-                        .then(|| {
-                            serde_json::to_value(drained.output())
-                                .unwrap_or(serde_json::Value::Null)
-                        });
-                    let followups = self
+                    post_tool_use_result = (!prepared.is_trusted_computer_use()
+                        && self
+                            .hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUse))
+                    .then(|| {
+                        serde_json::to_value(drained.output()).unwrap_or(serde_json::Value::Null)
+                    });
+                    let followups = match self
                         .handle_bridge_tool_success(
                             &prepared.tool_call_id,
                             &prepared.call_id,
@@ -720,7 +1109,16 @@ impl SessionActor {
                             &prepared.model_id,
                             &prepared.parsed_args,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(followups) => followups,
+                        Err(error) => {
+                            if prepared.is_trusted_computer_use() {
+                                self.invalidate_computer_use_session().await;
+                            }
+                            return Err(error);
+                        }
+                    };
                     deferred_followups.extend(followups);
                     if prepared.tool_name == "search_tool" {
                         let pi = self.chat_state_handle.get_prompt_index().await as i64;
@@ -742,8 +1140,10 @@ impl SessionActor {
                         )
                         .await;
                     deferred_followups.extend(err_followups);
-                    if self
-                        .hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUseFailure)
+                    if !prepared.is_trusted_computer_use()
+                        && self.hook_event_active(
+                            xai_grok_hooks::event::HookEventName::PostToolUseFailure,
+                        )
                     {
                         let raw_input: serde_json::Value =
                             serde_json::from_str(&prepared.raw_arguments)
@@ -899,6 +1299,14 @@ impl SessionActor {
     ) -> Result<Result<PreparedToolCall, ToolLoop>, acp::Error> {
         let tool_call_id = acp::ToolCallId::new(Arc::from(call.id.clone()));
         let model_id_str = self.current_model_id().await;
+        let mut redact_tool_arguments = {
+            let state = self.mcp_state.lock().await;
+            is_trusted_computer_use_call(
+                &state,
+                &call.function.name,
+                Some(&call.function.arguments),
+            )
+        };
         tracing::info!(
             "Model requesting tool: name='{}', call_id='{}'",
             call.function.name,
@@ -906,8 +1314,9 @@ impl SessionActor {
         );
         {
             let _span = tracing::info_span!("tool.register").entered();
-            let early_raw_input =
-                serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
+            let early_raw_input = (!redact_tool_arguments)
+                .then(|| serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok())
+                .flatten();
             let subagent_background = matches!(
                 call.function.name.as_str(),
                 "task" | "Task" | "spawn_subagent"
@@ -976,8 +1385,9 @@ impl SessionActor {
         );
         let parse_result = serde_json::from_str::<serde_json::Value>(args_str);
         let mut concatenated_json_count: usize = 0;
-        let raw_input = match &parse_result {
-            Ok(value) => value.clone(),
+        let raw_input = match parse_result {
+            Ok(value) => value,
+            Err(_) if redact_tool_arguments => trusted_computer_use_redacted_input(),
             Err(e) => {
                 if let Some(objects) = crate::session::helpers::tool_input_parsing::try_extract_concatenated_json_objects(
                     &call.function.arguments,
@@ -1038,14 +1448,45 @@ impl SessionActor {
                     &call.id,
                     &call.function.name,
                     err,
-                    &call.function.arguments,
+                    if redact_tool_arguments {
+                        TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS
+                    } else {
+                        &call.function.arguments
+                    },
                     &model_id_str,
                 )
                 .await?;
                 return Ok(Err(ToolLoop::ToolParsingError));
             }
         };
-        let access_kind = AccessKind::from(&tool_input);
+        // Resolve meta-dispatch before deriving permission input. A generic
+        // dispatch tool must never be able to tunnel into the capability-
+        // bearing client without the invocation-scoped context.
+        let dispatch_target_name = tool_input.dispatch_target_name();
+        let (trusted_computer_use, meta_targets_trusted_computer_use) = {
+            let state = self.mcp_state.lock().await;
+            (
+                state.is_configured_trusted_computer_use_tool(&call.function.name),
+                dispatch_target_name
+                    .as_deref()
+                    .is_some_and(|target| state.is_configured_trusted_computer_use_tool(target)),
+            )
+        };
+        redact_tool_arguments |= trusted_computer_use || meta_targets_trusted_computer_use;
+        if meta_targets_trusted_computer_use {
+            self.handle_tool_not_executed(
+                &call.id,
+                &tool_call_id,
+                "Trusted computer-use tools must be invoked directly.".to_string(),
+            )
+            .await?;
+            return Ok(Err(ToolLoop::Continue));
+        }
+
+        let mut access_kind = AccessKind::from(&tool_input);
+        if trusted_computer_use && let AccessKind::MCPTool { input, .. } = &mut access_kind {
+            *input = trusted_computer_use_redacted_input();
+        }
         let plan_gate = plan_mode_edit_gate(&self.plan_mode.lock(), &tool_input, &access_kind);
         if plan_gate != PlanEditGate::Allow {
             tracing::info_span!(
@@ -1063,18 +1504,19 @@ impl SessionActor {
             return Ok(Err(ToolLoop::Continue));
         }
         let tool_call_display = self
-            .send_tool_call_start(&tool_call_id, &call.function.name, tool_input.clone())
+            .send_tool_call_start(
+                &tool_call_id,
+                &call.function.name,
+                tool_input.clone(),
+                redact_tool_arguments,
+            )
             .await;
-        let _recovered_raw_input = if concatenated_json_count > 0 {
-            Some(raw_input.clone())
-        } else {
-            None
-        };
-        let dispatch_target_name = tool_input.dispatch_target_name();
         let resolved_tool_name = dispatch_target_name
             .clone()
             .unwrap_or_else(|| call.function.name.clone());
-        if self.hook_event_active(xai_grok_hooks::event::HookEventName::PreToolUse) {
+        if !trusted_computer_use
+            && self.hook_event_active(xai_grok_hooks::event::HookEventName::PreToolUse)
+        {
             let (hook_tool_input, hook_tool_input_truncated) =
                 xai_grok_hooks::event::truncate_payload(raw_input.clone());
             let envelope = self.make_hook_envelope(
@@ -1311,20 +1753,22 @@ impl SessionActor {
                     };
                     self.handle_tool_not_executed(&call.id, &tool_call_id, message)
                         .await?;
-                    let (tool_input_value, tool_input_truncated) =
-                        xai_grok_hooks::event::truncate_payload(raw_input.clone());
-                    self.dispatch_hook(
-                        xai_grok_hooks::event::HookEventName::PermissionDenied,
-                        xai_grok_hooks::event::HookPayload::PermissionDenied {
-                            tool_name: resolved_tool_name.clone(),
-                            tool_use_id: tool_call_id.to_string(),
-                            tool_input: tool_input_value,
-                            tool_input_truncated,
-                        },
-                        None,
-                        Some(&resolved_tool_name),
-                    )
-                    .await;
+                    if !trusted_computer_use {
+                        let (tool_input_value, tool_input_truncated) =
+                            xai_grok_hooks::event::truncate_payload(raw_input.clone());
+                        self.dispatch_hook(
+                            xai_grok_hooks::event::HookEventName::PermissionDenied,
+                            xai_grok_hooks::event::HookPayload::PermissionDenied {
+                                tool_name: resolved_tool_name.clone(),
+                                tool_use_id: tool_call_id.to_string(),
+                                tool_input: tool_input_value,
+                                tool_input_truncated,
+                            },
+                            None,
+                            Some(&resolved_tool_name),
+                        )
+                        .await;
+                    }
                     let loop_action = if is_policy_deny {
                         ToolLoop::Continue
                     } else {
@@ -1356,6 +1800,21 @@ impl SessionActor {
                 }
                 Decision::Allow | Decision::Ask => {}
             }
+        }
+        if trusted_computer_use
+            && !self
+                .stop_pending_computer_use_action_heartbeat(Some(&call.id))
+                .await
+        {
+            self.invalidate_computer_use_session().await;
+            self.handle_tool_not_executed(
+                &call.id,
+                &tool_call_id,
+                "Computer-use lease renewal failed before dispatch; request a fresh app state."
+                    .to_string(),
+            )
+            .await?;
+            return Ok(Err(ToolLoop::Continue));
         }
         let is_exit_plan_mode = matches!(&tool_input, ToolInput::ExitPlanMode(_));
         let is_file_backed_exit = is_file_backed_exit_plan_input(&tool_input);
@@ -1503,12 +1962,19 @@ impl SessionActor {
             call_id: call.id.clone(),
             tool_call_id,
             tool_name: call.function.name.clone(),
-            raw_arguments: call.function.arguments.clone(),
-            parsed_args: raw_input.clone(),
+            raw_arguments: if redact_tool_arguments {
+                TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS.to_string()
+            } else {
+                call.function.arguments.clone()
+            },
+            parsed_args: raw_input,
             model_id: model_id_str,
             concatenated_json_count,
             dispatch_target_name,
             is_read_only,
+            computer_use_call_id: trusted_computer_use.then(xai_tool_protocol::ToolCallId::new_v7),
+            computer_use_workflow_id: trusted_computer_use
+                .then(|| format!("turn-{}", self.current_turn_number.get())),
         };
         Ok(Ok(prepared))
     }
@@ -1694,9 +2160,14 @@ impl SessionActor {
         tool_call_id: &acp::ToolCallId,
         wire_name: &str,
         tool_call_input: ToolInput,
+        redact_raw_input: bool,
     ) -> Result<(String, acp::ToolKind, serde_json::Value), acp::Error> {
         #[allow(unused_mut)]
-        let mut raw_input = serde_json::to_value(&tool_call_input)?;
+        let mut raw_input = if redact_raw_input {
+            trusted_computer_use_redacted_input()
+        } else {
+            serde_json::to_value(&tool_call_input)?
+        };
         let canonical_meta = self.stamp_tool_meta(None, wire_name, Some(&tool_call_input));
         let (title, kind, locations, content) = match tool_call_input {
             ToolInput::ListDir(list_dir) => (
@@ -2591,7 +3062,13 @@ impl SessionActor {
     ) {
         use xai_grok_sampler::{SamplingChannel, SamplingEvent};
         match event {
-            SamplingEvent::StreamStarted { timestamp_ms, .. } => {
+            SamplingEvent::StreamStarted {
+                request_id,
+                timestamp_ms,
+            } => {
+                self.computer_use_stream_tools
+                    .lock()
+                    .restart_request(&request_id);
                 {
                     let prompt_id = self
                         .current_prompt_id
@@ -2661,11 +3138,11 @@ impl SessionActor {
                 }
             },
             SamplingEvent::ToolCallDelta {
+                request_id,
                 tool_index,
                 id,
                 name,
                 arguments_delta,
-                ..
             } => {
                 {
                     let mut cap = self.streaming_turn_capture.lock();
@@ -2673,13 +3150,32 @@ impl SessionActor {
                         cap.phase = CapturePhase::ToolCall;
                     }
                 }
-                self.send_buffered_xai_update(XaiSessionUpdate::ToolCallDeltaChunk {
-                    tool_call_id: id,
+                let named_tool_is_trusted = match name.as_deref() {
+                    Some(name) => Some(
+                        self.mcp_state
+                            .lock()
+                            .await
+                            .is_configured_trusted_computer_use_tool(name),
+                    ),
+                    None => None,
+                };
+                let deltas = self.computer_use_stream_tools.lock().filter_delta(
+                    request_id,
                     tool_index,
+                    id,
                     name,
                     arguments_delta,
-                })
-                .await;
+                    named_tool_is_trusted,
+                );
+                for delta in deltas {
+                    self.send_buffered_xai_update(XaiSessionUpdate::ToolCallDeltaChunk {
+                        tool_call_id: delta.id,
+                        tool_index,
+                        name: delta.name,
+                        arguments_delta: delta.arguments_delta,
+                    })
+                    .await;
+                }
             }
             SamplingEvent::ResponseStarted {
                 message_id,
@@ -2705,8 +3201,13 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::Completed {
-                response, metrics, ..
+                request_id,
+                response,
+                metrics,
             } => {
+                self.computer_use_stream_tools
+                    .lock()
+                    .clear_request(&request_id);
                 if let Some(tx) = self.turn_stream_drained.lock().take() {
                     let _ = tx.send(());
                 }
@@ -2753,6 +3254,9 @@ impl SessionActor {
                 doom_loop_triggers,
                 doom_loop_aborted_at_chunk,
             } => {
+                self.computer_use_stream_tools
+                    .lock()
+                    .clear_request(&request_id);
                 if kind == xai_grok_sampler::SamplingErrorKind::DoomLoopDetected {
                     let triggers = doom_loop_triggers.unwrap_or_default();
                     let attempt_number = {
@@ -2793,6 +3297,9 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::Failed { request_id, error } => {
+                self.computer_use_stream_tools
+                    .lock()
+                    .clear_request(&request_id);
                 xai_grok_telemetry::unified_log::error(
                     "shell.turn.inference_failed",
                     Some(self.session_info.id.0.as_ref()),
@@ -3402,5 +3909,159 @@ mod wait_interrupt_tests {
         );
         drop(new);
         assert_eq!(depth.depth(), 0);
+    }
+}
+
+#[cfg(test)]
+mod computer_use_safety_tests {
+    use super::*;
+
+    fn tool_call(name: &str, arguments: &str) -> crate::sampling::types::ToolCallResponse {
+        crate::sampling::types::ToolCallResponse {
+            id: format!("call-{name}"),
+            kind: "function".to_string(),
+            function: crate::sampling::types::ToolCallFunction::new(name, arguments),
+        }
+    }
+
+    fn trusted_state_without_client() -> crate::session::mcp_servers::McpState {
+        crate::session::mcp_servers::McpState::new_with_trusted_profile(
+            Vec::new(),
+            Default::default(),
+            xai_grok_mcp::computer_use::TrustedMcpProfile::ComputerUseV2,
+            std::path::PathBuf::from(
+                "/tmp/Grok Computer Use.app/Contents/MacOS/grok-computer-use-mcp",
+            ),
+        )
+        .expect("trusted test profile")
+    }
+
+    #[test]
+    fn reserved_names_are_sensitive_only_with_active_capability() {
+        let call = tool_call("xai_computer_use__click", r#"{"x":1,"y":2}"#);
+        let ordinary = crate::session::mcp_servers::McpState::new(Vec::new());
+        assert_eq!(
+            trusted_computer_use_batch_mask(&ordinary, &[call.clone()]),
+            [false]
+        );
+        assert!(!is_trusted_computer_use_call(
+            &ordinary,
+            "use_tool",
+            Some("not-json"),
+        ));
+
+        let trusted = trusted_state_without_client();
+        assert_eq!(trusted_computer_use_batch_mask(&trusted, &[call]), [true]);
+        assert!(!is_trusted_computer_use_call(
+            &trusted,
+            "xai_computer_use__not_in_contract",
+            Some("{}"),
+        ));
+        assert!(is_trusted_computer_use_call(
+            &trusted,
+            "use_tool",
+            Some("not-json"),
+        ));
+    }
+
+    #[test]
+    fn trusted_call_must_be_the_only_call_in_its_model_turn() {
+        let trusted = trusted_state_without_client();
+        let calls = vec![
+            tool_call("xai_computer_use__click", r#"{"x":1,"y":2}"#),
+            tool_call("xai_computer_use__scroll", r#"{"delta_y":10}"#),
+            tool_call(
+                "use_tool",
+                r#"{"tool_name":"xai_computer_use__drag","arguments":{}}"#,
+            ),
+        ];
+        let mask = trusted_computer_use_batch_mask(&trusted, &calls);
+        assert_eq!(mask, [true, true, false]);
+        assert!(rejects_trusted_computer_use_batch(&mask));
+        assert!(rejects_trusted_computer_use_batch(&[true, false]));
+        assert!(!rejects_trusted_computer_use_batch(&[true]));
+        assert!(!rejects_trusted_computer_use_batch(&[false, false]));
+    }
+
+    #[test]
+    fn protected_arguments_are_redacted_without_losing_exact_handoff_identity() {
+        let runtime_call_id = xai_tool_protocol::ToolCallId::new_v7();
+        let expected_call_id = runtime_call_id.to_string();
+        let mut prepared = PreparedToolCall {
+            call_id: "model-call".to_string(),
+            tool_call_id: acp::ToolCallId::new("model-call"),
+            tool_name: "xai_computer_use__click".to_string(),
+            raw_arguments: TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS.to_string(),
+            parsed_args: serde_json::json!({"x": 101, "y": 202}),
+            model_id: "test-model".to_string(),
+            concatenated_json_count: 0,
+            dispatch_target_name: None,
+            is_read_only: false,
+            computer_use_call_id: Some(runtime_call_id),
+            computer_use_workflow_id: Some("turn-7".to_string()),
+        };
+        let mut result = interrupted_wait_tool_result(&serde_json::json!({}));
+        result.prompt_text =
+            xai_grok_mcp::computer_use::COMPUTER_USE_OBSERVATION_PLACEHOLDER.to_string();
+
+        let (call_id, workflow_id) =
+            protected_handoff_identity(&prepared, &result).expect("protected handoff identity");
+        assert_eq!(call_id.as_str(), expected_call_id);
+        assert_eq!(workflow_id, "turn-7");
+
+        prepared.redact_computer_use_arguments_after_dispatch();
+        assert_eq!(prepared.parsed_args, trusted_computer_use_redacted_input());
+        let (call_id, workflow_id) = prepared
+            .computer_use_handoff_identity()
+            .expect("identity survives argument redaction");
+        assert_eq!(call_id.as_str(), expected_call_id);
+        assert_eq!(workflow_id, "turn-7");
+
+        result.prompt_text = "ordinary trusted text result".to_string();
+        assert!(protected_handoff_identity(&prepared, &result).is_none());
+    }
+
+    #[test]
+    fn trusted_failures_and_snapshotless_actions_require_session_invalidation() {
+        let mut prepared = PreparedToolCall {
+            call_id: "model-call".to_string(),
+            tool_call_id: acp::ToolCallId::new("model-call"),
+            tool_name: "xai_computer_use__click".to_string(),
+            raw_arguments: TRUSTED_COMPUTER_USE_REDACTED_ARGUMENTS.to_string(),
+            parsed_args: trusted_computer_use_redacted_input(),
+            model_id: "test-model".to_string(),
+            concatenated_json_count: 0,
+            dispatch_target_name: None,
+            is_read_only: false,
+            computer_use_call_id: Some(xai_tool_protocol::ToolCallId::new_v7()),
+            computer_use_workflow_id: Some("turn-8".to_string()),
+        };
+        let success = Ok(interrupted_wait_tool_result(&serde_json::json!({})));
+
+        assert!(trusted_computer_use_result_requires_invalidation(
+            &prepared, &success, false,
+        ));
+        assert!(!trusted_computer_use_result_requires_invalidation(
+            &prepared, &success, true,
+        ));
+
+        prepared.tool_name = "xai_computer_use__list_apps".to_string();
+        assert!(!trusted_computer_use_result_requires_invalidation(
+            &prepared, &success, false,
+        ));
+
+        prepared.tool_name = "xai_computer_use__get_app_state".to_string();
+        assert!(trusted_computer_use_result_requires_invalidation(
+            &prepared, &success, false,
+        ));
+
+        let failure = Err(xai_tool_runtime::ToolError::custom(
+            "computer_use_test",
+            "dispatch failed",
+        ));
+        prepared.tool_name = "xai_computer_use__list_apps".to_string();
+        assert!(trusted_computer_use_result_requires_invalidation(
+            &prepared, &failure, false,
+        ));
     }
 }

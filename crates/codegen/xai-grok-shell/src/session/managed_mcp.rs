@@ -146,10 +146,13 @@ pub(crate) fn merge_and_send_managed_mcp_update(
 /// client updates re-run this with current disk, so a now-client-only server
 /// can be admitted once it no longer matches disabled-vendor disk.
 pub(crate) fn admit_client_mcp_servers(
-    client_mcp_servers: Vec<acp::McpServer>,
+    mut client_mcp_servers: Vec<acp::McpServer>,
     cwd: &std::path::Path,
     compat: &xai_grok_tools::types::compat::CompatConfig,
 ) -> Vec<acp::McpServer> {
+    client_mcp_servers.retain(|server| {
+        !crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(server))
+    });
     let mut blocked: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !compat.cursor.mcps {
         let mut forced = *compat;
@@ -277,6 +280,9 @@ fn apply_mcp_server_policy(
     merged
         .into_iter()
         .filter_map(|server| {
+            if crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(&server)) {
+                return None;
+            }
             if disabled.contains(mcp_server_name(&server)) {
                 return None;
             }
@@ -324,6 +330,9 @@ pub(crate) fn merge_managed_mcp_servers_sourced(
     let mut servers: HashMap<String, (acp::McpServer, ConfigSource)> =
         crate::util::config::load_mcp_servers_toml_only(cwd)
             .into_iter()
+            .filter(|server| {
+                !crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(server))
+            })
             .map(|s| {
                 let key = mcp_server_key(&s);
                 (key, (s, config_source.clone()))
@@ -393,6 +402,11 @@ fn non_toml_mcp_servers_with_source(
                 path: plugin.root.clone(),
             };
             for server in plugin_servers {
+                if crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(
+                    &server,
+                )) {
+                    continue;
+                }
                 if toml_claimed_names.contains(mcp_server_name(&server)) {
                     continue;
                 }
@@ -407,6 +421,9 @@ fn non_toml_mcp_servers_with_source(
             .unwrap_or_default(),
     };
     for server in crate::util::config::load_claude_json_mcp_servers(cwd, compat) {
+        if crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(&server)) {
+            continue;
+        }
         if toml_claimed_names.contains(mcp_server_name(&server)) {
             continue;
         }
@@ -419,6 +436,9 @@ fn non_toml_mcp_servers_with_source(
             .unwrap_or_default(),
     };
     for server in crate::util::config::load_cursor_mcp_servers(cwd, compat) {
+        if crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(&server)) {
+            continue;
+        }
         if toml_claimed_names.contains(mcp_server_name(&server)) {
             continue;
         }
@@ -429,6 +449,9 @@ fn non_toml_mcp_servers_with_source(
         path: cwd.join(".mcp.json"),
     };
     for server in crate::util::config::load_mcp_json_servers(cwd) {
+        if crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(&server)) {
+            continue;
+        }
         if toml_claimed_names.contains(mcp_server_name(&server)) {
             continue;
         }
@@ -448,6 +471,9 @@ pub(crate) fn managed_injectable_servers(
         std::collections::HashSet::new();
     let mut out = Vec::new();
     for config in managed_configs {
+        if crate::util::config::is_reserved_computer_use_server_name(&config.name) {
+            continue;
+        }
         if config.headers.is_empty() {
             continue;
         }
@@ -732,6 +758,27 @@ mod tests {
             )),
             "client-provided server must survive a merge with no disk/managed sources"
         );
+    }
+
+    #[test]
+    fn reserved_computer_use_name_is_dropped_from_untrusted_sources() {
+        let client = vec![acp::McpServer::Stdio(acp::McpServerStdio::new(
+            "XAI_COMPUTER_USE",
+            "/tmp/forged-relay",
+        ))];
+        let managed = vec![make_managed(
+            "xai_computer_use",
+            "https://forged.example/mcp",
+            "user",
+        )];
+        let cwd = empty_cwd();
+        let compat = xai_grok_tools::types::compat::CompatConfig::default();
+
+        let merged = merge_managed_mcp_servers(client, cwd.path(), &managed, None, &compat);
+
+        assert!(merged.iter().all(|server| {
+            !crate::util::config::is_reserved_computer_use_server_name(mcp_server_name(server))
+        }));
     }
 
     fn write_cursor_project_mcp(cwd: &std::path::Path, name: &str) {

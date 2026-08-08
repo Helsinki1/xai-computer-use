@@ -1094,7 +1094,14 @@ impl SessionActor {
     }
     /// Ensure MCP tools are initialized (spawns processes and performs handshakes on first call)
     pub(super) async fn ensure_mcp_tools_initialized(&self) {
-        let (mcp_server_configs, meta_config_map, generation, existing_client_names, has_acp) = {
+        let (
+            mcp_server_configs,
+            meta_config_map,
+            generation,
+            existing_client_names,
+            has_acp,
+            has_trusted_computer_use,
+        ) = {
             let mut mcp_state = self.mcp_state.lock().await;
             if !mcp_state.try_start_init() {
                 tracing::debug!(
@@ -1128,9 +1135,10 @@ impl SessionActor {
                 mcp_state.generation(),
                 existing,
                 mcp_state.has_acp_servers(),
+                mcp_state.has_trusted_computer_use_profile(),
             )
         };
-        if mcp_server_configs.is_empty() && !has_acp {
+        if mcp_server_configs.is_empty() && !has_acp && !has_trusted_computer_use {
             let mut mcp_state = self.mcp_state.lock().await;
             if mcp_state.generation() == generation {
                 mcp_state.finish_init();
@@ -1187,20 +1195,29 @@ impl SessionActor {
             let mcp_state = self.mcp_state.lock().await;
             mcp_state.pending_acp_server_names()
         };
+        let trusted_computer_use_pending = has_trusted_computer_use
+            && !existing_client_names
+                .contains(xai_grok_mcp::computer_use::COMPUTER_USE_MCP_SERVER_NAME);
         {
             let mut mcp_state = self.mcp_state.lock().await;
-            let names: Vec<String> = configs_to_start
-                .iter()
-                .map(|c| mcp_server_name(c).to_string())
-                .chain(acp_pending_names.iter().cloned())
-                .collect();
+            let names: Vec<String> =
+                configs_to_start
+                    .iter()
+                    .map(|c| mcp_server_name(c).to_string())
+                    .chain(acp_pending_names.iter().cloned())
+                    .chain(trusted_computer_use_pending.then(|| {
+                        xai_grok_mcp::computer_use::COMPUTER_USE_MCP_SERVER_NAME.to_string()
+                    }))
+                    .collect();
             for name in &names {
                 tracing::info!(server = %name, "Added server to handshaking set");
             }
             mcp_state.mark_servers_initializing(names);
         }
         self.mcp_connecting_reminder_injected.set(false);
-        let init_total = (configs_to_start.len() + acp_pending_names.len()) as u32;
+        let init_total = (configs_to_start.len()
+            + acp_pending_names.len()
+            + trusted_computer_use_pending as usize) as u32;
         if let Ok(params) = serde_json::value::to_raw_value(&serde_json::json!({
             "total": init_total,
             "connected": 0,
@@ -1213,7 +1230,10 @@ impl SessionActor {
                     params.into(),
                 ));
         }
-        if configs_to_start.is_empty() && acp_pending_names.is_empty() {
+        if configs_to_start.is_empty()
+            && acp_pending_names.is_empty()
+            && !trusted_computer_use_pending
+        {
             let mut mcp_state = self.mcp_state.lock().await;
             if mcp_state.generation() == generation {
                 mcp_state.finish_init();
@@ -1244,7 +1264,10 @@ impl SessionActor {
         }
         let mut timer = crate::instrumentation_timer!("session.mcp_init");
         timer.with_field("session_id", self.session_info.id.0.as_ref());
-        timer.with_field("server_count", configs_to_start.len() as u64);
+        timer.with_field(
+            "server_count",
+            (configs_to_start.len() + trusted_computer_use_pending as usize) as u64,
+        );
         tracing::info!(
             "Starting MCP initialization ({} new servers, {} already initialized, strategy: {:?})",
             configs_to_start.len(),
@@ -1367,15 +1390,25 @@ impl SessionActor {
         let disabled_gateway_tools_bg = crate::util::config::get_all_mcp_disabled_tools(
             std::path::Path::new(&self.session_info.cwd),
         );
-        let server_transport_map: std::collections::HashMap<String, &'static str> =
+        let mut server_transport_map: std::collections::HashMap<String, &'static str> =
             mcp_server_configs
                 .iter()
                 .map(|c| (mcp_server_name(c).to_string(), mcp_transport_str(c)))
                 .collect();
-        let server_target_map: std::collections::HashMap<String, String> = mcp_server_configs
+        let mut server_target_map: std::collections::HashMap<String, String> = mcp_server_configs
             .iter()
             .map(|c| (mcp_server_name(c).to_string(), mcp_target_str(c)))
             .collect();
+        if has_trusted_computer_use {
+            server_transport_map.insert(
+                xai_grok_mcp::computer_use::COMPUTER_USE_MCP_SERVER_NAME.to_string(),
+                "stdio",
+            );
+            server_target_map.insert(
+                xai_grok_mcp::computer_use::COMPUTER_USE_MCP_SERVER_NAME.to_string(),
+                "signed native relay".to_string(),
+            );
+        }
         let scope_cwd = std::path::Path::new(self.session_info.cwd.as_str());
         let server_scope_map: std::collections::HashMap<String, &'static str> = mcp_server_configs
             .iter()
@@ -1387,7 +1420,9 @@ impl SessionActor {
                 )
             })
             .collect();
-        let server_count = (mcp_server_configs.len() + acp_pending_names.len()) as u32;
+        let server_count = (mcp_server_configs.len()
+            + acp_pending_names.len()
+            + has_trusted_computer_use as usize) as u32;
         let mcp_strategy = self.mcp_strategy.get();
         let is_reinit = !existing_client_names.is_empty();
         let event_writer = self.events.writer();
@@ -1871,7 +1906,16 @@ impl SessionActor {
     /// injector and the `/context` estimate. `None` when the template
     /// fails to render.
     async fn rendered_mcp_hint(&self) -> Option<String> {
-        let hint_template = "\nTo use MCP tools, you MUST call `${{ tools.by_kind.search_tool }}` first to retrieve the tool's input schema before calling `${{ tools.by_kind.use_tool }}`. NEVER guess parameter names — always use the exact schema returned by `${{ tools.by_kind.search_tool }}`.";
+        let hint_template = if self
+            .mcp_state
+            .lock()
+            .await
+            .has_trusted_computer_use_profile()
+        {
+            "\nFor ordinary MCP tools, you MUST call `${{ tools.by_kind.search_tool }}` first to retrieve the tool's input schema before calling `${{ tools.by_kind.use_tool }}`. The `xai_computer_use__*` tools are a privileged exception: they are already provided as direct tools and MUST be called directly, never through `${{ tools.by_kind.use_tool }}`. NEVER guess parameter names."
+        } else {
+            "\nTo use MCP tools, you MUST call `${{ tools.by_kind.search_tool }}` first to retrieve the tool's input schema before calling `${{ tools.by_kind.use_tool }}`. NEVER guess parameter names — always use the exact schema returned by `${{ tools.by_kind.search_tool }}`."
+        };
         self.tool_bridge_handle()
             .render_prompt(hint_template, &serde_json::json!({}))
             .await

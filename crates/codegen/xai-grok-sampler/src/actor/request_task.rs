@@ -23,9 +23,11 @@ use xai_grok_sampling_types::{
 };
 
 use crate::client::{ApiBackend, SamplingClient};
+use crate::commands::ProtectedSubmission;
 use crate::config::{RetryPolicy, SamplerConfig};
 use crate::events::{SamplingErrorInfo, SamplingErrorKind, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
+use crate::protected_overlay::{ProtectedInferenceOverlay, ProtectedOverlayAckGuard};
 use crate::retry::{
     self as retry_mod, RetryDecision, classify_error, clone_error, resolve_max_retries,
 };
@@ -85,16 +87,23 @@ pub(crate) async fn run_request_task(
     retry_policy: RetryPolicy,
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: CancellationToken,
+    protected: Option<ProtectedSubmission>,
     completion_tx: Option<oneshot::Sender<CompletionResult>>,
 ) -> RequestId {
     let mut completion_tx = completion_tx;
+    let (mut protected_overlay, protected_ack_tx) = match protected {
+        Some(ProtectedSubmission { overlay, ack_tx }) => (Some(overlay), Some(ack_tx)),
+        None => (None, None),
+    };
+    let mut protected_ack = ProtectedOverlayAckGuard::new(protected_ack_tx);
+    let has_protected_overlay = protected_overlay.is_some();
     let idle_timeout = Duration::from_secs(
         config
             .idle_timeout_secs
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
     );
     let configured_max_retries = config.max_retries.or(Some(retry_policy.max_retries));
-    let max_retries = if configured_max_retries == Some(0) {
+    let max_retries = if has_protected_overlay || configured_max_retries == Some(0) {
         0
     } else {
         resolve_max_retries(configured_max_retries)
@@ -151,6 +160,8 @@ pub(crate) async fn run_request_task(
             &cancel_token,
             doom_check,
             Arc::clone(&output_observed),
+            protected_overlay.take(),
+            &mut protected_ack,
         )
         .instrument(sampling_span.clone())
         .await;
@@ -479,10 +490,20 @@ async fn run_one_attempt(
     cancel_token: &CancellationToken,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     output_observed: Arc<AtomicBool>,
+    protected_overlay: Option<ProtectedInferenceOverlay>,
+    protected_ack: &mut ProtectedOverlayAckGuard,
 ) -> AttemptOutcome {
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
-            let (raw, metadata) = match client.conversation_stream(request).await {
+            let stream = match protected_overlay {
+                Some(overlay) => {
+                    client
+                        .conversation_stream_protected(request, overlay, protected_ack)
+                        .await
+                }
+                None => client.conversation_stream(request).await,
+            };
+            let (raw, metadata) = match stream {
                 Ok(pair) => pair,
                 Err(e) => return AttemptOutcome::InitFailed { error: e },
             };
@@ -500,11 +521,18 @@ async fn run_one_attempt(
             .await
         }
         ApiBackend::Responses => {
-            let (raw, metadata, doom_loop) =
-                match client.conversation_stream_responses(request).await {
-                    Ok(parts) => parts,
-                    Err(e) => return AttemptOutcome::InitFailed { error: e },
-                };
+            let stream = match protected_overlay {
+                Some(overlay) => {
+                    client
+                        .conversation_stream_responses_protected(request, overlay, protected_ack)
+                        .await
+                }
+                None => client.conversation_stream_responses(request).await,
+            };
+            let (raw, metadata, doom_loop) = match stream {
+                Ok(parts) => parts,
+                Err(e) => return AttemptOutcome::InitFailed { error: e },
+            };
             if doom_check.is_none()
                 && let Some(collector) = &doom_loop
             {
@@ -531,7 +559,15 @@ async fn run_one_attempt(
             .await
         }
         ApiBackend::Messages => {
-            let (raw, metadata) = match client.conversation_stream_messages(request).await {
+            let stream = match protected_overlay {
+                Some(overlay) => {
+                    client
+                        .conversation_stream_messages_protected(request, overlay, protected_ack)
+                        .await
+                }
+                None => client.conversation_stream_messages(request).await,
+            };
+            let (raw, metadata) = match stream {
                 Ok(pair) => pair,
                 Err(e) => return AttemptOutcome::InitFailed { error: e },
             };

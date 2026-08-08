@@ -2030,6 +2030,10 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 init_tracing_simple("cli");
                 return xai_grok_pager::mcp_cmd::run(mcp_args).await;
             }
+            Command::ComputerUse(computer_use_args) => {
+                init_tracing_simple("cli");
+                return xai_grok_pager::computer_use_cmd::run(computer_use_args).await;
+            }
             Command::Plugin(plugin_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();

@@ -1,12 +1,17 @@
 //! Public handle for talking to the sampler actor.
 
+use std::sync::Arc;
+
 use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, SamplingError};
 
-use crate::commands::SamplerCommand;
+use crate::commands::{ProtectedSubmission, SamplerCommand};
 use crate::config::SamplerConfig;
 use crate::metrics::InferenceLatencyStats;
+use crate::protected_overlay::{
+    ProtectedInferenceOverlay, ProtectedOverlayAck, ProtectedOverlayError, ProtectedOverlayKey,
+};
 use crate::types::RequestId;
 
 /// Cheaply-cloneable handle to the sampler actor.
@@ -18,6 +23,7 @@ use crate::types::RequestId;
 #[derive(Clone)]
 pub struct SamplerHandle {
     cmd_tx: mpsc::UnboundedSender<SamplerCommand>,
+    protected_overlay_key: Arc<ProtectedOverlayKey>,
 }
 
 impl SamplerHandle {
@@ -25,7 +31,10 @@ impl SamplerHandle {
     /// only [`SamplerActor::spawn`](crate::actor::SamplerActor::spawn)
     /// produces one of these.
     pub(crate) fn new(cmd_tx: mpsc::UnboundedSender<SamplerCommand>) -> Self {
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            protected_overlay_key: Arc::new(ProtectedOverlayKey),
+        }
     }
 
     /// Create a no-op handle that discards all commands.
@@ -37,7 +46,35 @@ impl SamplerHandle {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         // Receiver is dropped immediately; sends will fail but every
         // send-site uses `let _ = ...` so that is fine.
-        Self { cmd_tx }
+        Self::new(cmd_tx)
+    }
+
+    /// Validate and attest a PNG for request-only computer use.
+    ///
+    /// The returned move-only overlay is scoped to this handle family: it can
+    /// only be submitted by this handle or one of its clones.
+    pub fn attest_protected_overlay(
+        &self,
+        snapshot_id: impl Into<String>,
+        observation: impl Into<String>,
+        png: Vec<u8>,
+        expected_sha256_hex: &str,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<ProtectedInferenceOverlay, ProtectedOverlayError> {
+        ProtectedInferenceOverlay::attest(
+            Arc::clone(&self.protected_overlay_key),
+            snapshot_id.into(),
+            observation.into(),
+            png,
+            expected_sha256_hex,
+            pixel_width,
+            pixel_height,
+        )
+    }
+
+    pub(crate) fn protected_overlay_key(&self) -> &Arc<ProtectedOverlayKey> {
+        &self.protected_overlay_key
     }
 
     /// Submit a sampling request. Fire-and-forget -- results arrive
@@ -47,6 +84,7 @@ impl SamplerHandle {
             request_id,
             request: Box::new(request),
             config: None,
+            protected: None,
             completion_tx: None,
         });
     }
@@ -63,6 +101,7 @@ impl SamplerHandle {
             request_id,
             request: Box::new(request),
             config: Some(Box::new(config)),
+            protected: None,
             completion_tx: None,
         });
     }
@@ -115,6 +154,51 @@ impl SamplerHandle {
         request_id: RequestId,
         request: ConversationRequest,
     ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
+        let (ack, result) = self
+            .submit_and_collect_inner(request_id, request, None)
+            .await;
+        debug_assert!(ack.is_none());
+        result
+    }
+
+    /// Submit a request with one protected PNG attached only to its first and
+    /// only HTTP attempt.
+    ///
+    /// The acknowledgement is resolved by the final backend body builder,
+    /// before HTTP execution. `NotAttached` means no model-produced response
+    /// from this call is safe to dispatch as computer-use actions.
+    pub async fn submit_and_collect_protected(
+        &self,
+        request_id: RequestId,
+        request: ConversationRequest,
+        overlay: ProtectedInferenceOverlay,
+    ) -> (
+        ProtectedOverlayAck,
+        Result<(ConversationResponse, InferenceLatencyStats), SamplingError>,
+    ) {
+        if !overlay.is_authorized_for(self) {
+            return (
+                ProtectedOverlayAck::NotAttached,
+                Err(SamplingError::InvalidConfiguration(
+                    "protected overlay capability mismatch",
+                )),
+            );
+        }
+        let (ack, result) = self
+            .submit_and_collect_inner(request_id, request, Some(overlay))
+            .await;
+        (ack.unwrap_or(ProtectedOverlayAck::NotAttached), result)
+    }
+
+    async fn submit_and_collect_inner(
+        &self,
+        request_id: RequestId,
+        request: ConversationRequest,
+        overlay: Option<ProtectedInferenceOverlay>,
+    ) -> (
+        Option<ProtectedOverlayAck>,
+        Result<(ConversationResponse, InferenceLatencyStats), SamplingError>,
+    ) {
         // RAII guard: when this future is dropped (cancel, panic, or normal return),
         // tell the sampler actor to cancel the in-flight request_id. No-op if the
         // actor already finished and removed it from its active set.
@@ -132,6 +216,16 @@ impl SamplerHandle {
         }
 
         let (completion_tx, completion_rx) = oneshot::channel();
+        let (protected, ack_rx) = match overlay {
+            Some(overlay) => {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                (
+                    Some(Box::new(ProtectedSubmission { overlay, ack_tx })),
+                    Some(ack_rx),
+                )
+            }
+            None => (None, None),
+        };
         let cancel_id = request_id.clone();
 
         // Only arm the guard if Submit actually reached the actor.
@@ -141,6 +235,7 @@ impl SamplerHandle {
                 request_id,
                 request: Box::new(request),
                 config: None,
+                protected,
                 completion_tx: Some(completion_tx),
             })
             .ok()
@@ -148,10 +243,17 @@ impl SamplerHandle {
                 cmd_tx: self.cmd_tx.clone(),
                 request_id: cancel_id,
             });
-        completion_rx.await.unwrap_or_else(|_| {
+        // Await the pre-dispatch acknowledgement first. This orders it before
+        // any successful completion can reach a caller that executes actions.
+        let ack = match ack_rx {
+            Some(rx) => Some(rx.await.unwrap_or(ProtectedOverlayAck::NotAttached)),
+            None => None,
+        };
+        let result = completion_rx.await.unwrap_or_else(|_| {
             Err(SamplingError::auth_unknown(
                 "sampler actor dropped before completion",
             ))
-        })
+        });
+        (ack, result)
     }
 }

@@ -1563,6 +1563,35 @@ impl WorkspaceOps {
         call_id: &str,
         session_id: Option<&str>,
     ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        self.call_tool_inner(name, args, call_id, session_id, None)
+            .await
+    }
+
+    /// Local-only dispatch with invocation-scoped typed extensions.
+    ///
+    /// Capability-bearing contexts must never cross the workspace proxy wire,
+    /// so proxy-backed workspaces reject this path instead of serializing or
+    /// silently dropping the extensions.
+    pub async fn call_tool_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        session_id: Option<&str>,
+        context: xai_tool_runtime::ToolCallContext,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        let call_id = context.call_id.to_string();
+        self.call_tool_inner(name, args, &call_id, session_id, Some(context))
+            .await
+    }
+
+    async fn call_tool_inner(
+        &self,
+        name: &str,
+        args: Value,
+        call_id: &str,
+        session_id: Option<&str>,
+        context: Option<xai_tool_runtime::ToolCallContext>,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
         match self {
             Self::Local { handle } => {
                 let session_id = session_id.ok_or_else(|| {
@@ -1580,9 +1609,23 @@ impl WorkspaceOps {
                         ),
                     )
                 })?;
-                session.toolset().call(name, args, call_id, None).await
+                match context {
+                    Some(context) => {
+                        session
+                            .toolset()
+                            .call_with_context(name, args, context, None)
+                            .await
+                    }
+                    None => session.toolset().call(name, args, call_id, None).await,
+                }
             }
             Self::Proxy { client } => {
+                if context.is_some() {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "unsupported_tool_context",
+                        "invocation-scoped tool context requires a local workspace",
+                    ));
+                }
                 if !client.is_connected() {
                     return Err(xai_tool_runtime::ToolError::network_error(
                         "The workspace server connection was lost. \

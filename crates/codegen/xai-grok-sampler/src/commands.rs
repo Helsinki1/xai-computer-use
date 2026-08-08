@@ -10,7 +10,15 @@ use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, Samplin
 
 use crate::config::SamplerConfig;
 use crate::metrics::InferenceLatencyStats;
+use crate::protected_overlay::{ProtectedInferenceOverlay, ProtectedOverlayAck};
 use crate::types::RequestId;
+
+/// Capability-checked payload and its pre-dispatch acknowledgement channel.
+/// Kept as one move-only unit so the actor cannot accidentally separate them.
+pub(crate) struct ProtectedSubmission {
+    pub(crate) overlay: ProtectedInferenceOverlay,
+    pub(crate) ack_tx: oneshot::Sender<ProtectedOverlayAck>,
+}
 
 /// Commands sent from a [`SamplerHandle`](crate::handle::SamplerHandle)
 /// to the actor task.
@@ -25,6 +33,7 @@ pub(crate) enum SamplerCommand {
         request_id: RequestId,
         request: Box<ConversationRequest>,
         config: Option<Box<SamplerConfig>>,
+        protected: Option<Box<ProtectedSubmission>>,
         completion_tx: Option<
             oneshot::Sender<Result<(ConversationResponse, InferenceLatencyStats), SamplingError>>,
         >,
