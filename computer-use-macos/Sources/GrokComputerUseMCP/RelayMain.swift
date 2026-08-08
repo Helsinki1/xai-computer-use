@@ -7,7 +7,13 @@ struct GrokComputerUseRelay {
     static func main() async {
         let clientIdentifier = UUID().uuidString.lowercased()
         do {
+            #if DEBUG
+            if LocalE2EConfiguration.allowedBundleIdentifiers() == nil {
+                try TrustedHostParentVerifier.verify()
+            }
+            #else
             try TrustedHostParentVerifier.verify()
+            #endif
             let client = try AgentClient(clientIdentifier: clientIdentifier)
             let server = MCPServer(caller: client, clientIdentifier: clientIdentifier)
             while let line = readLine(strippingNewline: true) {

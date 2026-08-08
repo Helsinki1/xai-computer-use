@@ -10,13 +10,9 @@ final class LocalE2EDesktopDriver: DesktopDriving, @unchecked Sendable {
     private let allowedBundleIDs: Set<String>
 
     init?(base: any DesktopDriving, environment: [String: String] = ProcessInfo.processInfo.environment) {
-        guard environment["GROK_COMPUTER_USE_LOCAL_E2E"] == "1",
-              let rawIDs = environment["GROK_COMPUTER_USE_LOCAL_E2E_ALLOWED_BUNDLE_IDS"]
-        else { return nil }
-        let identifiers = rawIDs.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-        guard !identifiers.isEmpty, identifiers.allSatisfy({ (3...255).contains($0.utf8.count) }) else { return nil }
+        guard let identifiers = LocalE2EConfiguration.allowedBundleIdentifiers(environment: environment) else { return nil }
         self.base = base
-        allowedBundleIDs = Set(identifiers)
+        allowedBundleIDs = identifiers
     }
 
     func listApps() async throws -> [AppDescriptor] {

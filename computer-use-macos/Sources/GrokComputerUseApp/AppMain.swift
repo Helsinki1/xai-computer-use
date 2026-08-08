@@ -36,10 +36,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             let driver: any DesktopDriving = baseDriver
             #endif
             let runtime = try ComputerUseRuntime(driver: driver, receipts: receipts)
+            #if DEBUG
+            let peerVerifier: any PeerVerifying = LocalE2EConfiguration.allowedBundleIdentifiers() == nil
+                ? SignedRelayPeerVerifier()
+                : LocalE2ERelayPeerVerifier()
+            #else
+            let peerVerifier: any PeerVerifying = SignedRelayPeerVerifier()
+            #endif
             let server = try AgentSocketServer(
                 socketURL: socketURL,
                 runtime: runtime,
-                peerVerifier: SignedRelayPeerVerifier(),
+                peerVerifier: peerVerifier,
                 singletonLease: singletonLease
             )
             self.server = server

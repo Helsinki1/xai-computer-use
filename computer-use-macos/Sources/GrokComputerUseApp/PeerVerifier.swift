@@ -12,6 +12,46 @@ protocol PeerVerifying: Sendable {
     func verify(socket: Int32) throws -> VerifiedPeer
 }
 
+#if DEBUG
+/// The test account is the security boundary for local E2E.  This verifier keeps
+/// the private-socket UID and bundled-relay path checks, but deliberately does
+/// not require an Apple-issued identity (which an ad-hoc build cannot have).
+final class LocalE2ERelayPeerVerifier: PeerVerifying, @unchecked Sendable {
+    private let trustedRelayURL: URL
+
+    init(appBundleURL: URL = Bundle.main.bundleURL) {
+        trustedRelayURL = appBundleURL.resolvingSymlinksInPath().standardizedFileURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent(ComputerUsePaths.relayExecutableName, isDirectory: false)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+    }
+
+    func verify(socket: Int32) throws -> VerifiedPeer {
+        var peerUID = uid_t.max
+        var peerGID = gid_t.max
+        guard getpeereid(socket, &peerUID, &peerGID) == 0, peerUID == geteuid() else {
+            throw ComputerUseError.permissionDenied("The local E2E relay has an untrusted user identity.")
+        }
+        var peerPID = pid_t(0)
+        var peerPIDSize = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(socket, SOL_LOCAL, LOCAL_PEERPID, &peerPID, &peerPIDSize) == 0, peerPID > 0,
+              executableURL(for: peerPID) == trustedRelayURL
+        else {
+            throw ComputerUseError.permissionDenied("The local E2E peer is not this app's bundled relay.")
+        }
+        return VerifiedPeer(processIdentifier: peerPID, userIdentifier: peerUID)
+    }
+
+    private func executableURL(for processIdentifier: pid_t) -> URL? {
+        var buffer = [CChar](repeating: 0, count: 4 * 1024)
+        guard proc_pidpath(processIdentifier, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath().standardizedFileURL
+    }
+}
+#endif
+
 final class SignedRelayPeerVerifier: PeerVerifying, @unchecked Sendable {
     private let appBundleURL: URL
     private let trustedRelayURL: URL

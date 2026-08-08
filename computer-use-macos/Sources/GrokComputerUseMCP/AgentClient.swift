@@ -8,7 +8,8 @@ actor AgentClient: ToolCalling {
     private let socketURL: URL
     private let appURL: URL
     private let expectedAppExecutableURL: URL
-    private let relaySigningIdentity: ProcessSigningIdentity
+    private let relaySigningIdentity: ProcessSigningIdentity?
+    private let localE2E: Bool
     private var descriptor: Int32?
     private var sessionIdentifier: String?
     private var sessionKey: Data?
@@ -20,6 +21,21 @@ actor AgentClient: ToolCalling {
         }
         self.clientIdentifier = clientIdentifier
         socketURL = try ComputerUsePaths.socketURL()
+        #if DEBUG
+        if LocalE2EConfiguration.allowedBundleIdentifiers() != nil {
+            localE2E = true
+            appURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+            expectedAppExecutableURL = appURL
+                .appendingPathComponent("Contents", isDirectory: true)
+                .appendingPathComponent("MacOS", isDirectory: true)
+                .appendingPathComponent(ComputerUsePaths.appExecutableName, isDirectory: false)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            relaySigningIdentity = nil
+            return
+        }
+        #endif
+        localE2E = false
         appURL = ComputerUsePaths.installedAppURL()
         expectedAppExecutableURL = appURL
             .appendingPathComponent("Contents", isDirectory: true)
@@ -276,6 +292,22 @@ actor AgentClient: ToolCalling {
     }
 
     private func verifyServerPeer(_ socket: Int32) throws {
+        if localE2E {
+            var peerUID = uid_t.max
+            var peerGID = gid_t.max
+            guard getpeereid(socket, &peerUID, &peerGID) == 0, peerUID == geteuid() else {
+                throw ComputerUseError.permissionDenied("The local E2E app-agent server identity is not trusted.")
+            }
+            var peerPID = pid_t(0)
+            var peerPIDSize = socklen_t(MemoryLayout<pid_t>.size)
+            guard getsockopt(socket, SOL_LOCAL, LOCAL_PEERPID, &peerPID, &peerPIDSize) == 0,
+                  peerPID > 0,
+                  Self.executableURL(processIdentifier: peerPID) == expectedAppExecutableURL
+            else {
+                throw ComputerUseError.permissionDenied("The local E2E peer is not the configured app.")
+            }
+            return
+        }
         try verifyInstalledBundleSeal()
         var peerUID = uid_t.max
         var peerGID = gid_t.max
@@ -292,7 +324,7 @@ actor AgentClient: ToolCalling {
         try Self.requireAppleSignature(
             code: appCode,
             identifier: GrokComponentSigningPolicy.appIdentifier,
-            teamIdentifier: relaySigningIdentity.teamIdentifier
+            teamIdentifier: relaySigningIdentity!.teamIdentifier
         )
         let appIdentity = try Self.signingIdentity(
             appCode,
@@ -300,7 +332,7 @@ actor AgentClient: ToolCalling {
         )
         let pathAfterValidation = try Self.executableURL(for: appCode)
         guard pathAfterValidation == pathBeforeValidation,
-              GrokComponentSigningPolicy.accepts(app: appIdentity, relay: relaySigningIdentity)
+              GrokComponentSigningPolicy.accepts(app: appIdentity, relay: relaySigningIdentity!)
         else {
             throw ComputerUseError.permissionDenied("The app-agent server identity is not trusted.")
         }
@@ -311,7 +343,7 @@ actor AgentClient: ToolCalling {
         let flags = SecCSFlags(rawValue: 0)
         let requirement = try Self.appleRequirement(
             identifier: GrokComponentSigningPolicy.appIdentifier,
-            teamIdentifier: relaySigningIdentity.teamIdentifier
+            teamIdentifier: relaySigningIdentity!.teamIdentifier
         )
         guard SecStaticCodeCreateWithPath(appURL as CFURL, flags, &appCode) == errSecSuccess,
               let appCode,
@@ -320,7 +352,7 @@ actor AgentClient: ToolCalling {
                   appCode,
                   executableBasename: expectedAppExecutableURL.lastPathComponent
               ),
-              GrokComponentSigningPolicy.accepts(app: identity, relay: relaySigningIdentity)
+              GrokComponentSigningPolicy.accepts(app: identity, relay: relaySigningIdentity!)
         else {
             throw ComputerUseError.permissionDenied("The installed app bundle seal is invalid.")
         }
@@ -378,6 +410,12 @@ actor AgentClient: ToolCalling {
             throw ComputerUseError.permissionDenied("The process executable path is unavailable.")
         }
         return executableURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private static func executableURL(processIdentifier: pid_t) -> URL? {
+        var buffer = [CChar](repeating: 0, count: 4 * 1024)
+        guard proc_pidpath(processIdentifier, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath().standardizedFileURL
     }
 
     private static func requireAppleSignature(
@@ -469,6 +507,9 @@ actor AgentClient: ToolCalling {
     }
 
     private func launchApp() throws {
+        if localE2E {
+            throw ComputerUseError.stateUnavailable("Start the local E2E app first; it will not be launched automatically.")
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-gj", appURL.path]
