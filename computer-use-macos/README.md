@@ -74,6 +74,8 @@ Version 2 retains authenticated action receipts indefinitely so an old action id
 
 Run `computer-use-macos/scripts/certify.sh` on an Apple Silicon macOS runner. It validates plists and scripts, runs fake-backed Swift tests, builds both executables, assembles/signs the app, submits that exact bundle for notarization, staples the ticket, and verifies the code seal and Gatekeeper acceptance. Set `GROK_COMPUTER_USE_RUN_RUST_CONTRACT_TESTS=1` to also run the Rust carrier contract tests.
 
-The repository-level `.github/workflows/computer-use-macos.yml` defines the macOS CI job.
+The macOS CI job is temporarily disabled at
+`.github/workflows-disabled/computer-use-macos.yml`. Move it back to
+`.github/workflows/` to re-enable it.
 
 Linux cannot compile or execute AppKit, Accessibility, ScreenCaptureKit, Security, Keychain, or macOS SQLite/fullfsync behavior. On Linux, only source/contract inspection and shell/YAML checks are meaningful; release certification must run on the macOS target above.

@@ -1,3 +1,4 @@
+# Disabled temporarily. Move this file back to .github/workflows/ to re-enable it.
 name: computer-use macos
 
 on:
