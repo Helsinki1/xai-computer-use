@@ -40,7 +40,7 @@ seals, the allowlisted Grok executable identity, private authenticated socket,
 and the complete snapshot/action safety protocol. It skips only the production
 Apple Silicon, Team ID, Gatekeeper, and notarization gates.
 
-The installer stages and verifies the new bundle before moving it into place. An existing install is moved to a timestamped backup and is never silently deleted.
+The installer stages and verifies the new bundle before moving it into place, brings first-launch permission and Keychain prompts forward, and waits up to 60 seconds for the private listener. An existing install is kept as a temporary rollback copy until the new companion remains running and replaces the previous listener socket. Failed upgrades restore and relaunch the previous app; successful upgrades remove the rollback copy so LaunchServices and Spotlight see only one **Grok Computer Use** app. A first installation that is still awaiting approval is left installed instead of being mistaken for a failed upgrade and deleted.
 
 ## Coordinate contract
 

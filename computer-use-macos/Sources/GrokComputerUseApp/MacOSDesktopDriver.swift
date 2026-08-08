@@ -587,14 +587,27 @@ final class MacOSDesktopDriver: DesktopDriving {
             copyUInt32($0, attribute: "AXWindowNumber") == window.windowID
         }
         let identityCandidates = numbered.isEmpty ? candidates : numbered
-        var matches = identityCandidates.filter {
+        let frameMatches = identityCandidates.filter {
             guard let frame = copyFrame($0) else { return false }
             return framesAreEqual(frame, window.frame)
         }
-        if let title = window.title, !title.isEmpty {
-            matches = matches.filter { copyString($0, attribute: kAXTitleAttribute) == title }
+        if frameMatches.count == 1 {
+            return frameMatches[0]
         }
-        return matches.count == 1 ? matches[0] : nil
+        // Chromium decorates AX titles with browser/profile suffixes that are
+        // absent from ScreenCaptureKit. Titles are therefore only a secondary
+        // discriminator when exact process, window-number (when available),
+        // and frame matching still leave more than one candidate.
+        guard frameMatches.count > 1,
+              let title = window.title,
+              !title.isEmpty
+        else {
+            return nil
+        }
+        let titleMatches = frameMatches.filter {
+            copyString($0, attribute: kAXTitleAttribute) == title
+        }
+        return titleMatches.count == 1 ? titleMatches[0] : nil
     }
 
     private func revalidate(app: AppTarget, expectedGeometry: WindowGeometry) async throws {
