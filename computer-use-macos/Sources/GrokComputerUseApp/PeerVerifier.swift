@@ -74,7 +74,10 @@ final class SignedRelayPeerVerifier: PeerVerifying, @unchecked Sendable {
             code: appCode,
             executableBasename: appPathBeforeValidation.lastPathComponent
         )
-        guard GrokComponentSigningPolicy.isTrustedApp(appIdentity) else {
+        guard GrokComponentSigningPolicy.isTrustedApp(
+            appIdentity,
+            allowAdHoc: GrokHostSigningPolicy.localAdHocSignaturesAllowed
+        ) else {
             throw ComputerUseError.permissionDenied("The running app identity is not trusted.")
         }
         try Self.requireAppleSignature(
@@ -114,7 +117,11 @@ final class SignedRelayPeerVerifier: PeerVerifying, @unchecked Sendable {
         let appPathAfterValidation = try executableURL(for: getpid())
         guard relayPathAfterValidation == relayPathBeforeValidation,
               appPathAfterValidation == appPathBeforeValidation,
-              GrokComponentSigningPolicy.accepts(app: appIdentity, relay: relayIdentity)
+              GrokComponentSigningPolicy.accepts(
+                  app: appIdentity,
+                  relay: relayIdentity,
+                  allowAdHoc: GrokHostSigningPolicy.localAdHocSignaturesAllowed
+              )
         else {
             throw ComputerUseError.permissionDenied("The app-agent peer code signature is not trusted.")
         }
@@ -148,11 +155,11 @@ final class SignedRelayPeerVerifier: PeerVerifying, @unchecked Sendable {
             &rawInformation
         ) == errSecSuccess,
               let information = rawInformation as? [String: Any],
-              let identifier = information[kSecCodeInfoIdentifier as String] as? String,
-              let teamIdentifier = information[kSecCodeInfoTeamIdentifier as String] as? String
+              let identifier = information[kSecCodeInfoIdentifier as String] as? String
         else {
             throw ComputerUseError.permissionDenied("The component signing identity is incomplete.")
         }
+        let teamIdentifier = information[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
         return ProcessSigningIdentity(
             identifier: identifier,
             teamIdentifier: teamIdentifier,
@@ -241,12 +248,22 @@ final class SignedRelayPeerVerifier: PeerVerifying, @unchecked Sendable {
         guard [
             GrokComponentSigningPolicy.appIdentifier,
             GrokComponentSigningPolicy.relayIdentifier,
-        ].contains(identifier),
-        GrokHostSigningPolicy.isValidTeamIdentifier(teamIdentifier)
-        else {
+        ].contains(identifier) else {
             throw ComputerUseError.permissionDenied("The component signing requirement is invalid.")
         }
-        let expression = "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        let expression: String
+        if GrokHostSigningPolicy.isValidTeamIdentifier(teamIdentifier) {
+            expression = "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        } else {
+#if DEBUG
+            guard teamIdentifier.isEmpty else {
+                throw ComputerUseError.permissionDenied("The component signing requirement is invalid.")
+            }
+            expression = "identifier \"\(identifier)\""
+#else
+            throw ComputerUseError.permissionDenied("The component signing requirement is invalid.")
+#endif
+        }
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(
             expression as CFString,

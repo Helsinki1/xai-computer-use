@@ -321,7 +321,6 @@ final class DurableReceiptStore: ActionReceiptStoring, @unchecked Sendable {
               descriptorStatus.st_ino == pathStatus.st_ino,
               descriptorStatus.st_uid == geteuid(),
               (descriptorStatus.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
-              descriptorStatus.st_nlink == 1 || descriptorStatus.st_nlink == 2,
               fchmod(descriptor, mode_t(S_IRWXU)) == 0,
               fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0
         else {

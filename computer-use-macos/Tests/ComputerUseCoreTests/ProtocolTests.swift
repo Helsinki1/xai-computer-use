@@ -141,6 +141,36 @@ final class ProtocolTests: XCTestCase {
             .failClosed
         )
     }
+
+    func testListAppsAcceptsNullAsTheOptionalEmptyArgumentsObject() async throws {
+        let caller = RecordingToolCaller()
+        let server = MCPServer(caller: caller, clientIdentifier: "test-client")
+        _ = await server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{}}}"#)
+        let rawResponse = await server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":null,"_meta":{"xai/computer-use-v2":{"profile":"computer-use-v2","logical_call_id":"logical-call","session_id":"session","workflow_id":"workflow","action_id":"action","tool_name":"list_apps"},"progressToken":1}}}"#)
+        let response = try XCTUnwrap(rawResponse)
+
+        let decoded = try JSONDecoder().decode(JSONValue.self, from: Data(response.utf8))
+        XCTAssertNil(decoded.objectValue?["error"])
+        let call = await caller.lastCall
+        XCTAssertEqual(call?.name, "list_apps")
+        XCTAssertEqual(call?.arguments, [:])
+    }
+}
+
+private actor RecordingToolCaller: ToolCalling {
+    private(set) var lastCall: (name: String, arguments: [String: JSONValue])?
+
+    func callTool(
+        name: String,
+        arguments: [String: JSONValue],
+        context: ToolCallContext
+    ) async -> ToolExecutionResult {
+        lastCall = (name, arguments)
+        return ToolExecutionResult(text: "ok")
+    }
+
+    func actionOutcome(identifier: String) async -> ActionReceipt? { nil }
+    func clientDisconnected(identifier: String) async {}
 }
 
 private let canonicalSchemas = #"""

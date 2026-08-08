@@ -8,8 +8,9 @@ identity="${GROK_COMPUTER_USE_CODESIGN_IDENTITY:--}"
 version="${GROK_COMPUTER_USE_VERSION:-0.1.0}"
 build_number="${GROK_COMPUTER_USE_BUILD_NUMBER:-1}"
 
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-  echo "build-app.sh requires Apple Silicon macOS" >&2
+machine_arch="$(uname -m)"
+if [[ "$(uname -s)" != "Darwin" || ( "${machine_arch}" != "arm64" && "${machine_arch}" != "x86_64" ) ]]; then
+  echo "build-app.sh requires macOS on arm64 or x86_64" >&2
   exit 1
 fi
 major_version="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f1)"
@@ -21,10 +22,14 @@ if [[ "${configuration}" != "debug" && "${configuration}" != "release" ]]; then
   echo "usage: $0 [debug|release]" >&2
   exit 1
 fi
+if [[ "${machine_arch}" != "arm64" && "${configuration}" != "debug" ]]; then
+  echo "non-Apple-Silicon builds are supported only for local debug testing" >&2
+  exit 1
+fi
 
-swift build --package-path "${component_root}" -c "${configuration}" --arch arm64 --product GrokComputerUseApp
-swift build --package-path "${component_root}" -c "${configuration}" --arch arm64 --product grok-computer-use-mcp
-binary_dir="$(swift build --package-path "${component_root}" -c "${configuration}" --arch arm64 --show-bin-path)"
+swift build --package-path "${component_root}" -c "${configuration}" --arch "${machine_arch}" --product GrokComputerUseApp
+swift build --package-path "${component_root}" -c "${configuration}" --arch "${machine_arch}" --product grok-computer-use-mcp
+binary_dir="$(swift build --package-path "${component_root}" -c "${configuration}" --arch "${machine_arch}" --show-bin-path)"
 
 dist_dir="${component_root}/dist"
 app_path="${dist_dir}/Grok Computer Use.app"
@@ -48,7 +53,10 @@ fi
 
 sign_args=(--force --sign "${identity}")
 if [[ "${identity}" != "-" ]]; then
-  sign_args+=(--options runtime --timestamp)
+  sign_args+=(--options runtime)
+  if [[ "${configuration}" == "release" ]]; then
+    sign_args+=(--timestamp)
+  fi
 fi
 /usr/bin/codesign "${sign_args[@]}" \
   --identifier com.xai.grok.computer-use.mcp \
@@ -60,5 +68,5 @@ fi
 
 echo "built ${app_path}"
 if [[ "${identity}" == "-" ]]; then
-  echo "warning: ad-hoc signatures are for local tests only; Grok's trusted profile requires a Gatekeeper-valid stable identity" >&2
+  echo "warning: ad-hoc signatures work only with a debug app and GROK_COMPUTER_USE_LOCAL_DEV=1" >&2
 fi

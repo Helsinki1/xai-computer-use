@@ -30,6 +30,7 @@ pub enum ComputerUseCommand {
 #[serde(rename_all = "camelCase")]
 struct ComputerUseStatus {
     supported: bool,
+    local_development: bool,
     configured: bool,
     installed: bool,
     secure_path: bool,
@@ -59,6 +60,7 @@ fn collect_status() -> Result<ComputerUseStatus> {
     let secure_path = installed
         && xai_grok_shell::util::computer_use::path_chain_has_no_symlinks(&app_path, &relay_path);
     let supported = xai_grok_shell::util::computer_use::platform_supported();
+    let local_development = xai_grok_shell::util::computer_use::local_development_enabled();
     let signature_valid =
         supported && secure_path && xai_grok_shell::util::computer_use::signature_valid(&app_path);
     let configured = xai_grok_shell::util::config::computer_use_enabled();
@@ -66,6 +68,7 @@ fn collect_status() -> Result<ComputerUseStatus> {
 
     Ok(ComputerUseStatus {
         supported,
+        local_development,
         configured,
         installed,
         secure_path,
@@ -83,6 +86,7 @@ fn run_status(json: bool) -> Result<()> {
     } else {
         println!("Computer Use");
         println!("  supported: {}", status.supported);
+        println!("  local development: {}", status.local_development);
         println!("  configured: {}", status.configured);
         println!("  installed: {}", status.installed);
         println!("  secure path: {}", status.secure_path);
