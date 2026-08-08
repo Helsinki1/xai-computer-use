@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import modal
+
+
+APP_NAME = "linux-computer-use-mvp"
+LOCAL_SUBTREE = Path(__file__).resolve().parent
+REMOTE_SUBTREE = "/root/computer-use-linux"
+SUPPORT_DIR = "/root/.local/share/grok-computer-use"
+RUNTIME_DIR = "/root/modal-runtime"
+LOG_DIR = "/root/modal-logs"
+
+
+desktop_state = modal.Volume.from_name(f"{APP_NAME}-state", create_if_missing=True)
+desktop_logs = modal.Volume.from_name(f"{APP_NAME}-logs", create_if_missing=True)
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "build-essential",
+        "ca-certificates",
+        "curl",
+        "novnc",
+        "openbox",
+        "pkg-config",
+        "python3",
+        "python3-xdg",
+        "websockify",
+        "x11-utils",
+        "x11vnc",
+        "xauth",
+        "xterm",
+        "xvfb",
+    )
+    .env(
+        {
+            "CARGO_HOME": "/root/.cargo",
+            "RUSTUP_HOME": "/root/.rustup",
+            "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+    )
+    .add_local_dir(str(LOCAL_SUBTREE), REMOTE_SUBTREE, copy=True)
+    .run_commands(
+        "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.94.0",
+        f"bash -lc 'source /root/.cargo/env && cd {REMOTE_SUBTREE} && cargo build --release'",
+        f"bash -lc 'cd {REMOTE_SUBTREE} && ./scripts/install.sh'",
+        f"chmod +x {REMOTE_SUBTREE}/scripts/start_modal_x11_demo.sh {REMOTE_SUBTREE}/scripts/mcp_smoke_test.py",
+    )
+)
+
+app = modal.App(APP_NAME)
+
+
+def desktop_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "HOME": "/root",
+        "DISPLAY_NUM": ":1",
+        "SCREEN_GEOMETRY": "1440x900x24",
+        "XDG_RUNTIME_DIR": RUNTIME_DIR,
+        "LOG_ROOT": LOG_DIR,
+    }
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60 * 24,
+    min_containers=1,
+    scaledown_window=60 * 30,
+    volumes={
+        SUPPORT_DIR: desktop_state,
+        LOG_DIR: desktop_logs,
+    },
+)
+@modal.web_server(6080, startup_timeout=180)
+def desktop() -> None:
+    subprocess.run(
+        ["/bin/bash", "-lc", f"cd {REMOTE_SUBTREE} && ./scripts/start_modal_x11_demo.sh"],
+        env=desktop_env(),
+        check=True,
+    )
+
+
+@app.function(
+    image=image,
+    timeout=60 * 10,
+    volumes={
+        SUPPORT_DIR: desktop_state,
+        LOG_DIR: desktop_logs,
+    },
+)
+def smoke_test() -> str:
+    env = {
+        **desktop_env(),
+        "DISPLAY": ":1",
+        "XDG_SESSION_TYPE": "x11",
+    }
+    subprocess.run(["mkdir", "-p", env["XDG_RUNTIME_DIR"], LOG_DIR], check=True)
+    xvfb = subprocess.Popen(
+        ["Xvfb", ":1", "-screen", "0", "1440x900x24", "-ac", "+extension", "RANDR"],
+        env=env,
+    )
+    daemon = None
+    try:
+        daemon = subprocess.Popen(
+            ["/root/.local/libexec/grok-computer-use/grok-computer-use-daemon"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        socket_path = Path(env["XDG_RUNTIME_DIR"]) / "grok-computer-use" / "agent-v2.sock"
+        for _ in range(30):
+            if socket_path.exists():
+                break
+            time.sleep(1)
+        if not socket_path.exists():
+            raise RuntimeError("daemon socket did not become ready")
+        completed = subprocess.run(
+            ["python3", f"{REMOTE_SUBTREE}/scripts/mcp_smoke_test.py"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout
+    finally:
+        if daemon is not None:
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+        xvfb.terminate()
+        xvfb.wait(timeout=5)
+
+
+@app.function(
+    image=image,
+    timeout=60 * 2,
+    volumes={LOG_DIR: desktop_logs},
+)
+def tail_logs() -> str:
+    lines: list[str] = []
+    for name in ["daemon.log", "openbox.log", "x11vnc.log", "xvfb.log"]:
+        path = Path(LOG_DIR) / name
+        if path.exists():
+            lines.append(f"== {name} ==")
+            lines.extend(path.read_text().splitlines()[-40:])
+    return "\n".join(lines)
+
+
+@app.local_entrypoint()
+def main() -> None:
+    print("Reusable deployment:")
+    print("  modal deploy computer-use-linux/modal_demo.py")
+    print("")
+    print("Then open the deployed web endpoint for the `desktop` function.")
+    print("")
+    print("One-off checks:")
+    print("  modal run computer-use-linux/modal_demo.py::smoke_test")
+    print("  modal run computer-use-linux/modal_demo.py::tail_logs")
