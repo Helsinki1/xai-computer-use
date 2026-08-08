@@ -23,12 +23,15 @@ one, the scripts fall back to ad-hoc signing and permissions must be granted
 again after every rebuild.
 
 ```sh
-export GROK_COMPUTER_USE_LOCAL_DEV=1
-computer-use-macos/scripts/install-app.sh --build
-PROTOC=/usr/local/bin/protoc cargo build -p xai-grok-pager-bin
-computer-use-macos/scripts/run-local-grok.sh computer-use enable
-computer-use-macos/scripts/run-local-grok.sh
+computer-use-macos/scripts/run-local.sh computer-use enable
+computer-use-macos/scripts/run-local.sh
 ```
+
+`run-local.sh` prompts for `XAI_API_KEY` when it is not already exported,
+installs a debug app only when it is missing or stale, uses Cargo's incremental
+build, and then launches Grok. Pass `--rebuild` to reinstall the app
+unconditionally, or `--no-rebuild` to launch only the existing artifacts.
+Arguments after `--` are passed to Grok.
 
 Approve Accessibility and Screen Recording for **Grok Computer Use** when
 macOS prompts, then restart both the app and Grok. Local mode still requires
