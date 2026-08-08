@@ -12,6 +12,31 @@ This subtree contains the native macOS 14/Apple Silicon computer-use app and its
 
 Ad-hoc signing (`GROK_COMPUTER_USE_CODESIGN_IDENTITY=-`) is supported only for local build/test. The trusted Grok profile also performs Gatekeeper assessment, so production builds must be signed consistently and notarized. Reusing the same bundle identifier and signing identity preserves the app's TCC identity across upgrades.
 
+## Local debug mode
+
+Intel Macs and machines without a Developer ID certificate can run an explicit
+debug-only mode. Release builds do not contain the ad-hoc trust branch.
+
+Set `GROK_COMPUTER_USE_CODESIGN_IDENTITY` to a stable Apple Development
+identity to preserve macOS privacy permissions across local rebuilds. Without
+one, the scripts fall back to ad-hoc signing and permissions must be granted
+again after every rebuild.
+
+```sh
+export GROK_COMPUTER_USE_LOCAL_DEV=1
+computer-use-macos/scripts/install-app.sh --build
+PROTOC=/usr/local/bin/protoc cargo build -p xai-grok-pager-bin
+computer-use-macos/scripts/run-local-grok.sh computer-use enable
+computer-use-macos/scripts/run-local-grok.sh
+```
+
+Approve Accessibility and Screen Recording for **Grok Computer Use** when
+macOS prompts, then restart both the app and Grok. Local mode still requires
+the fixed install path, exact app and relay identifiers, valid ad-hoc code
+seals, the allowlisted Grok executable identity, private authenticated socket,
+and the complete snapshot/action safety protocol. It skips only the production
+Apple Silicon, Team ID, Gatekeeper, and notarization gates.
+
 The installer stages and verifies the new bundle before moving it into place. An existing install is moved to a timestamped backup and is never silently deleted.
 
 ## Coordinate contract

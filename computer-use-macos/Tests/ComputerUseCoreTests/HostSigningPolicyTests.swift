@@ -104,6 +104,31 @@ final class HostSigningPolicyTests: XCTestCase {
         ))
     }
 
+    func testDebugPolicyAllowsOnlyMatchingAdHocComponentIdentities() {
+#if DEBUG
+        let app = ProcessSigningIdentity(
+            identifier: GrokComponentSigningPolicy.appIdentifier,
+            teamIdentifier: "",
+            executableBasename: GrokComponentSigningPolicy.appBasename
+        )
+        let relay = ProcessSigningIdentity(
+            identifier: GrokComponentSigningPolicy.relayIdentifier,
+            teamIdentifier: "",
+            executableBasename: GrokComponentSigningPolicy.relayBasename
+        )
+        XCTAssertTrue(GrokComponentSigningPolicy.accepts(app: app, relay: relay, allowAdHoc: true))
+        XCTAssertFalse(GrokHostSigningPolicy.accepts(
+            relay: relay,
+            host: ProcessSigningIdentity(
+                identifier: "untrusted-host",
+                teamIdentifier: "",
+                executableBasename: "untrusted-host"
+            ),
+            allowAdHoc: true
+        ))
+#endif
+    }
+
     private func accepts(identifier: String, basename: String, teamIdentifier: String = "XAI1234567") -> Bool {
         GrokHostSigningPolicy.accepts(
             relay: relay,

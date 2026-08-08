@@ -16,22 +16,32 @@ package enum GrokComponentSigningPolicy {
     package static let relayIdentifier = "com.xai.grok.computer-use.mcp"
     package static let relayBasename = "grok-computer-use-mcp"
 
-    package static func accepts(app: ProcessSigningIdentity, relay: ProcessSigningIdentity) -> Bool {
-        isTrustedApp(app)
-            && isTrustedRelay(relay)
+    package static func accepts(
+        app: ProcessSigningIdentity,
+        relay: ProcessSigningIdentity,
+        allowAdHoc: Bool = false
+    ) -> Bool {
+        isTrustedApp(app, allowAdHoc: allowAdHoc)
+            && isTrustedRelay(relay, allowAdHoc: allowAdHoc)
             && app.teamIdentifier == relay.teamIdentifier
     }
 
-    package static func isTrustedApp(_ identity: ProcessSigningIdentity) -> Bool {
+    package static func isTrustedApp(_ identity: ProcessSigningIdentity, allowAdHoc: Bool = false) -> Bool {
         identity.identifier == appIdentifier
             && identity.executableBasename == appBasename
-            && GrokHostSigningPolicy.isValidTeamIdentifier(identity.teamIdentifier)
+            && GrokHostSigningPolicy.isPermittedTeamIdentifier(
+                identity.teamIdentifier,
+                allowAdHoc: allowAdHoc
+            )
     }
 
-    package static func isTrustedRelay(_ identity: ProcessSigningIdentity) -> Bool {
+    package static func isTrustedRelay(_ identity: ProcessSigningIdentity, allowAdHoc: Bool = false) -> Bool {
         identity.identifier == relayIdentifier
             && identity.executableBasename == relayBasename
-            && GrokHostSigningPolicy.isValidTeamIdentifier(identity.teamIdentifier)
+            && GrokHostSigningPolicy.isPermittedTeamIdentifier(
+                identity.teamIdentifier,
+                allowAdHoc: allowAdHoc
+            )
     }
 }
 
@@ -45,8 +55,12 @@ package enum GrokHostSigningPolicy {
     private static let releasePrefix = "grok-"
     private static let releaseSuffix = "-macos-aarch64"
 
-    package static func accepts(relay: ProcessSigningIdentity, host: ProcessSigningIdentity) -> Bool {
-        guard GrokComponentSigningPolicy.isTrustedRelay(relay),
+    package static func accepts(
+        relay: ProcessSigningIdentity,
+        host: ProcessSigningIdentity,
+        allowAdHoc: Bool = false
+    ) -> Bool {
+        guard GrokComponentSigningPolicy.isTrustedRelay(relay, allowAdHoc: allowAdHoc),
               relay.teamIdentifier == host.teamIdentifier,
               isAllowedHostName(host.executableBasename)
         else {
@@ -64,6 +78,25 @@ package enum GrokHostSigningPolicy {
     package static func isValidTeamIdentifier(_ value: String) -> Bool {
         (1...64).contains(value.utf8.count)
             && value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) })
+    }
+
+    package static func isPermittedTeamIdentifier(_ value: String, allowAdHoc: Bool) -> Bool {
+        if isValidTeamIdentifier(value) { return true }
+#if DEBUG
+        // Ad-hoc signatures have no Team ID. This branch is absent from
+        // release builds and is used only by the explicit local Grok mode.
+        return allowAdHoc && value.isEmpty
+#else
+        return false
+#endif
+    }
+
+    package static var localAdHocSignaturesAllowed: Bool {
+#if DEBUG
+        true
+#else
+        false
+#endif
     }
 
     private static func isVersionedReleaseName(_ value: String) -> Bool {

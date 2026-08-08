@@ -6,19 +6,32 @@ component_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_app="${component_root}/dist/Grok Computer Use.app"
 applications_dir="${HOME}/Applications"
 target_app="${applications_dir}/Grok Computer Use.app"
+local_development="${GROK_COMPUTER_USE_LOCAL_DEV:-0}"
 
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-  echo "install-app.sh requires Apple Silicon macOS" >&2
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "install-app.sh requires macOS" >&2
+  exit 1
+fi
+if [[ "$(uname -m)" != "arm64" && "${local_development}" != "1" ]]; then
+  echo "Intel installation requires GROK_COMPUTER_USE_LOCAL_DEV=1" >&2
   exit 1
 fi
 if [[ "${1:-}" == "--build" || ! -d "${source_app}" ]]; then
-  "${component_root}/scripts/build-app.sh" release
+  if [[ "${local_development}" == "1" ]]; then
+    "${component_root}/scripts/build-app.sh" debug
+  else
+    "${component_root}/scripts/build-app.sh" release
+  fi
 fi
 if [[ -L "${applications_dir}" || -L "${target_app}" ]]; then
   echo "refusing to install through a symbolic link" >&2
   exit 1
 fi
-"${component_root}/scripts/verify-bundle.sh" "${source_app}"
+verify_script="${component_root}/scripts/verify-bundle.sh"
+if [[ "${local_development}" == "1" ]]; then
+  verify_script="${component_root}/scripts/verify-local-bundle.sh"
+fi
+"${verify_script}" "${source_app}"
 /bin/mkdir -p "${applications_dir}"
 
 staging_root="$(/usr/bin/mktemp -d "${applications_dir}/.grok-computer-use.install.XXXXXX")"
@@ -30,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 /usr/bin/ditto "${source_app}" "${staged_app}"
-"${component_root}/scripts/verify-bundle.sh" "${staged_app}"
+"${verify_script}" "${staged_app}"
 
 if /usr/bin/pgrep -u "$(/usr/bin/id -u)" -x GrokComputerUseApp >/dev/null; then
   /usr/bin/pkill -TERM -u "$(/usr/bin/id -u)" -x GrokComputerUseApp
@@ -67,7 +80,7 @@ if ! /bin/mv "${staged_app}" "${target_app}"; then
   restore_previous_app
   exit 1
 fi
-if ! "${component_root}/scripts/verify-bundle.sh" "${target_app}" \
+if ! "${verify_script}" "${target_app}" \
   || ! /usr/bin/open -gj "${target_app}"; then
   restore_previous_app
   echo "installation verification or launch failed; the previous app was restored" >&2

@@ -17,7 +17,10 @@ enum TrustedHostParentVerifier {
             relayCode,
             executableBasename: relayPath.lastPathComponent
         )
-        guard GrokComponentSigningPolicy.isTrustedRelay(relayIdentity) else {
+        guard GrokComponentSigningPolicy.isTrustedRelay(
+            relayIdentity,
+            allowAdHoc: GrokHostSigningPolicy.localAdHocSignaturesAllowed
+        ) else {
             throw untrustedParent()
         }
         try requireValidSignature(
@@ -39,7 +42,11 @@ enum TrustedHostParentVerifier {
 
         guard getppid() == parentPID,
               hostPathBeforeValidation == hostPathAfterValidation,
-              GrokHostSigningPolicy.accepts(relay: relayIdentity, host: hostIdentity)
+              GrokHostSigningPolicy.accepts(
+                  relay: relayIdentity,
+                  host: hostIdentity,
+                  allowAdHoc: GrokHostSigningPolicy.localAdHocSignaturesAllowed
+              )
         else {
             throw untrustedParent()
         }
@@ -78,17 +85,28 @@ enum TrustedHostParentVerifier {
     private static func appleRequirement(
         identifier: String?,
         teamIdentifier: String
-    ) throws -> SecRequirement {
-        guard GrokHostSigningPolicy.isValidTeamIdentifier(teamIdentifier) else {
+    ) throws -> SecRequirement? {
+        let expression: String
+        if GrokHostSigningPolicy.isValidTeamIdentifier(teamIdentifier) {
+            expression = "anchor apple generic and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        } else {
+#if DEBUG
+            guard teamIdentifier.isEmpty else { throw untrustedParent() }
+            guard let identifier else { return nil }
+            expression = "identifier \"\(identifier)\""
+#else
             throw untrustedParent()
+#endif
         }
-        var expression = "anchor apple generic and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        var scopedExpression = expression
         if let identifier {
-            expression += " and identifier \"\(identifier)\""
+            if GrokHostSigningPolicy.isValidTeamIdentifier(teamIdentifier) {
+                scopedExpression += " and identifier \"\(identifier)\""
+            }
         }
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(
-            expression as CFString,
+            scopedExpression as CFString,
             SecCSFlags(rawValue: 0),
             &requirement
         ) == errSecSuccess, let requirement else {
@@ -112,12 +130,11 @@ enum TrustedHostParentVerifier {
         ) == errSecSuccess,
               let information = rawInformation as? [String: Any],
               let identifier = information[kSecCodeInfoIdentifier as String] as? String,
-              let teamIdentifier = information[kSecCodeInfoTeamIdentifier as String] as? String,
-              !identifier.isEmpty,
-              !teamIdentifier.isEmpty
+              !identifier.isEmpty
         else {
             throw untrustedParent()
         }
+        let teamIdentifier = information[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
         return ProcessSigningIdentity(
             identifier: identifier,
             teamIdentifier: teamIdentifier,

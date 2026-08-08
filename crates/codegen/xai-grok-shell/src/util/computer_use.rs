@@ -6,6 +6,7 @@ pub const APP_BUNDLE_NAME: &str = "Grok Computer Use.app";
 pub const RELAY_RELATIVE_PATH: &str = "Contents/MacOS/grok-computer-use-mcp";
 pub const APP_SIGNING_IDENTIFIER: &str = "com.xai.grok.computer-use";
 pub const RELAY_SIGNING_IDENTIFIER: &str = "com.xai.grok.computer-use.mcp";
+pub const LOCAL_DEVELOPMENT_ENV: &str = "GROK_COMPUTER_USE_LOCAL_DEV";
 
 pub fn app_bundle_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join("Applications").join(APP_BUNDLE_NAME))
@@ -28,8 +29,18 @@ pub fn path_chain_has_no_symlinks(app: &Path, relay: &Path) -> bool {
         })
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Local ad-hoc trust is available only in debug Grok builds and must be
+/// explicitly enabled for each process invocation.
+pub fn local_development_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os(LOCAL_DEVELOPMENT_ENV).is_some_and(|value| value == "1")
+}
+
+#[cfg(target_os = "macos")]
 pub fn platform_supported() -> bool {
+    if !cfg!(target_arch = "aarch64") && !local_development_enabled() {
+        return false;
+    }
     std::process::Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
@@ -40,7 +51,7 @@ pub fn platform_supported() -> bool {
         .is_some_and(|major| major >= 14)
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(target_os = "macos"))]
 pub fn platform_supported() -> bool {
     false
 }
@@ -69,6 +80,11 @@ pub fn signature_valid(app: &Path) -> bool {
     let Some(relay_identity) = code_signature_identity(&app.join(RELAY_RELATIVE_PATH)) else {
         return false;
     };
+    if local_development_enabled() {
+        return codesign
+            && app_identity.identifier == APP_SIGNING_IDENTIFIER
+            && relay_identity.identifier == RELAY_SIGNING_IDENTIFIER;
+    }
     codesign
         && gatekeeper
         && app_identity.identifier == APP_SIGNING_IDENTIFIER

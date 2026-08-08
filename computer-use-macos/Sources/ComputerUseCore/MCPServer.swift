@@ -97,18 +97,27 @@ public actor MCPServer {
                 throw JSONRPCFailure(id: request.id ?? .null, code: -32_600, message: "Invalid Request")
             }
             let params = try requiredObject(request.params, id: id)
-            try requireAllowedKeys(params, allowed: ["name", "arguments", "_meta"], id: id)
+            guard Set(params.keys).isSubset(of: ["name", "arguments", "_meta"]) else {
+                throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: tool call fields")
+            }
             guard let name = params["name"]?.stringValue,
                   ToolCatalog.acceptedToolNames.contains(name)
             else {
-                throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params")
+                throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: tool name")
             }
             let arguments: [String: JSONValue]
             if let rawArguments = params["arguments"] {
-                guard let object = rawArguments.objectValue else {
-                    throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params")
+                if rawArguments == .null, name == "list_apps" {
+                    // MCP arguments are optional. Some clients serialize an
+                    // omitted zero-argument input as JSON null instead of
+                    // leaving the field out; for the one empty-schema public
+                    // tool, null and {} are equivalent.
+                    arguments = [:]
+                } else if let object = rawArguments.objectValue {
+                    arguments = object
+                } else {
+                    throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: tool arguments")
                 }
-                arguments = object
             } else {
                 arguments = [:]
             }
@@ -191,12 +200,20 @@ public actor MCPServer {
         id: JSONValue
     ) throws -> TrustedInvocation {
         guard let root = value?.objectValue,
-              Set(root.keys) == ["xai/computer-use-v2"],
-              let payload = root["xai/computer-use-v2"]?.objectValue,
-              Set(payload.keys) == [
-                "profile", "logical_call_id", "session_id", "workflow_id", "action_id", "tool_name",
-              ],
-              payload["profile"] == .string("computer-use-v2"),
+              Set(root.keys).isSubset(of: ["xai/computer-use-v2", "progressToken"]),
+              let payload = root["xai/computer-use-v2"]?.objectValue
+        else {
+            throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: trusted metadata envelope")
+        }
+        if let progressToken = root["progressToken"], validID(progressToken) == nil {
+            throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: trusted metadata envelope")
+        }
+        guard Set(payload.keys) == [
+            "profile", "logical_call_id", "session_id", "workflow_id", "action_id", "tool_name",
+        ] else {
+            throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: trusted metadata fields")
+        }
+        guard payload["profile"] == .string("computer-use-v2"),
               payload["tool_name"] == .string(toolName),
               let logicalCallID = payload["logical_call_id"]?.stringValue,
               let sessionID = payload["session_id"]?.stringValue,
@@ -204,7 +221,7 @@ public actor MCPServer {
               let actionID = payload["action_id"]?.stringValue,
               [logicalCallID, sessionID, workflowID, actionID].allSatisfy(validTrustedIdentity)
         else {
-            throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params")
+            throw JSONRPCFailure(id: id, code: -32_602, message: "Invalid params: trusted metadata values")
         }
         return TrustedInvocation(actionIdentifier: actionID)
     }
