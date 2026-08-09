@@ -35,9 +35,11 @@ Then launch Grok Build:
 computer-use-macos/scripts/run-local.sh
 ```
 
-`run-local.sh` prompts for `XAI_API_KEY` when it is not already exported. It
-also builds Grok, installs or updates the companion when needed, signs both
-components consistently, and launches the TUI.
+`run-local.sh` uses Grok's normal login flow and reuses an existing Grok
+session. An exported `XAI_API_KEY` is still supported, but the launcher does
+not require or prompt for one. It also builds Grok, installs or updates the
+companion when needed, signs both components consistently, and launches the
+TUI.
 
 Approve **Grok Computer Use** under System Settings → Privacy & Security →
 Accessibility and Screen Recording when macOS requests access. If permissions

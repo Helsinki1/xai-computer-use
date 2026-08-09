@@ -10,6 +10,29 @@ enum ProtectedResponseLease {
     Release,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtectedResponseBindingError {
+    MultipleCalls,
+    UntrustedTool,
+    InvalidToolName,
+    UnknownComputerUseTool,
+    MalformedArguments,
+    SnapshotMismatch,
+}
+
+impl ProtectedResponseBindingError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::MultipleCalls => "multiple_calls",
+            Self::UntrustedTool => "untrusted_tool",
+            Self::InvalidToolName => "invalid_tool_name",
+            Self::UnknownComputerUseTool => "unknown_computer_use_tool",
+            Self::MalformedArguments => "malformed_arguments",
+            Self::SnapshotMismatch => "snapshot_mismatch",
+        }
+    }
+}
+
 enum SamplerCollectionError {
     Sampling(xai_grok_sampling_types::SamplingError),
     Protected(acp::Error),
@@ -69,22 +92,25 @@ fn protected_tool_calls_lease(
     state: &crate::session::mcp_servers::McpState,
     calls: &[xai_grok_sampling_types::ToolCall],
     snapshot_id: &str,
-) -> Result<ProtectedResponseLease, ()> {
+) -> Result<ProtectedResponseLease, ProtectedResponseBindingError> {
     if calls.is_empty() {
         return Ok(ProtectedResponseLease::Release);
     }
     if calls.len() != 1 {
-        return Err(());
+        return Err(ProtectedResponseBindingError::MultipleCalls);
     }
 
     let call = &calls[0];
     if !state.is_configured_trusted_computer_use_tool(&call.name) {
         // Protected screenshots may drive only one direct computer-use call.
         // Ordinary and meta-dispatch tools must never escape this turn.
-        return Err(());
+        return Err(ProtectedResponseBindingError::UntrustedTool);
     }
-    let (_, tool_name) = crate::session::mcp_servers::parse_mcp_tool_name(&call.name).ok_or(())?;
-    match xai_grok_mcp::computer_use::classify_tool(&tool_name).ok_or(())? {
+    let (_, tool_name) = crate::session::mcp_servers::parse_mcp_tool_name(&call.name)
+        .ok_or(ProtectedResponseBindingError::InvalidToolName)?;
+    match xai_grok_mcp::computer_use::classify_tool(&tool_name)
+        .ok_or(ProtectedResponseBindingError::UnknownComputerUseTool)?
+    {
         xai_grok_mcp::computer_use::ComputerUseToolClass::Observation => {
             Ok(ProtectedResponseLease::Release)
         }
@@ -92,16 +118,41 @@ fn protected_tool_calls_lease(
             let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .ok()
                 .and_then(|value| value.as_object().cloned())
-                .ok_or(())?;
+                .ok_or(ProtectedResponseBindingError::MalformedArguments)?;
             if arguments
                 .get("snapshot_id")
                 .and_then(serde_json::Value::as_str)
                 != Some(snapshot_id)
             {
-                return Err(());
+                return Err(ProtectedResponseBindingError::SnapshotMismatch);
             }
             Ok(ProtectedResponseLease::RetainForAction)
         }
+    }
+}
+
+fn protected_binding_recovery_call(
+    bundle_id: &str,
+    window_id: u32,
+) -> xai_grok_sampling_types::ToolCall {
+    let name = format!(
+        "{}{}get_app_state",
+        xai_grok_mcp::computer_use::COMPUTER_USE_MCP_SERVER_NAME,
+        crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER,
+    );
+    xai_grok_sampling_types::ToolCall {
+        id: std::sync::Arc::from(format!(
+            "call-computer-use-recovery-{}",
+            xai_tool_protocol::ToolCallId::new_v7()
+        )),
+        name,
+        arguments: std::sync::Arc::from(
+            serde_json::json!({
+                "bundle_id": bundle_id,
+                "window_id": window_id,
+            })
+            .to_string(),
+        ),
     }
 }
 
@@ -140,7 +191,10 @@ mod protected_tool_calls_lease_tests {
             protected_tool_calls_lease(&state, &calls, "snapshot-0000001"),
             Ok(ProtectedResponseLease::RetainForAction)
         ));
-        assert!(protected_tool_calls_lease(&state, &calls, "snapshot-0000002").is_err());
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &calls, "snapshot-0000002"),
+            Err(ProtectedResponseBindingError::SnapshotMismatch)
+        ));
     }
 
     #[test]
@@ -164,7 +218,10 @@ mod protected_tool_calls_lease_tests {
     fn rejects_tunneled_mixed_multiple_and_malformed_actions() {
         let state = state();
         let ordinary = [call("bash", r#"{"command":"echo unsafe"}"#)];
-        assert!(protected_tool_calls_lease(&state, &ordinary, "snapshot-0000001").is_err());
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &ordinary, "snapshot-0000001"),
+            Err(ProtectedResponseBindingError::UntrustedTool)
+        ));
 
         let tunneled = [call(
             "use_tool",
@@ -177,7 +234,10 @@ mod protected_tool_calls_lease_tests {
             r#"{"snapshot_id":"snapshot-0000001","element_id":"e1","direction":"down"}"#,
         );
         let mixed = [action.clone(), call("read_file", r#"{"file_path":"x"}"#)];
-        assert!(protected_tool_calls_lease(&state, &mixed, "snapshot-0000001").is_err());
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &mixed, "snapshot-0000001"),
+            Err(ProtectedResponseBindingError::MultipleCalls)
+        ));
         let multiple = [
             action,
             call(
@@ -185,9 +245,31 @@ mod protected_tool_calls_lease_tests {
                 r#"{"snapshot_id":"snapshot-0000001","key":"escape"}"#,
             ),
         ];
-        assert!(protected_tool_calls_lease(&state, &multiple, "snapshot-0000001").is_err());
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &multiple, "snapshot-0000001"),
+            Err(ProtectedResponseBindingError::MultipleCalls)
+        ));
         let malformed = [call("xai_computer_use__click", "not-json")];
-        assert!(protected_tool_calls_lease(&state, &malformed, "snapshot-0000001").is_err());
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &malformed, "snapshot-0000001"),
+            Err(ProtectedResponseBindingError::MalformedArguments)
+        ));
+    }
+
+    #[test]
+    fn recovery_call_is_one_read_only_refresh_for_the_same_app() {
+        let recovery = protected_binding_recovery_call("com.apple.TextEdit", 4336);
+        assert_eq!(recovery.name, "xai_computer_use__get_app_state");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&recovery.arguments).expect("valid recovery arguments");
+        assert_eq!(
+            arguments,
+            serde_json::json!({
+                "bundle_id": "com.apple.TextEdit",
+                "window_id": 4336,
+            })
+        );
+        assert!(recovery.id.starts_with("call-computer-use-recovery-"));
     }
 }
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
@@ -1414,7 +1496,11 @@ impl SessionActor {
                        invalidated; request a fresh app state before retrying."
             .to_string();
         tracing::warn!(reason, "protected computer-use turn failed closed");
-        self.log_terminal_failure("computer_use_integrity", None, &message);
+        self.log_terminal_failure(
+            "computer_use_integrity",
+            None,
+            &format!("{message} Internal stage: {reason}."),
+        );
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: "computer_use_integrity".to_string(),
@@ -1511,6 +1597,8 @@ impl SessionActor {
         let workflow_id = handoff.workflow_id().to_string();
         let observation = handoff.into_observation();
         let snapshot_id = observation.snapshot_id().to_string();
+        let bundle_id = observation.bundle_id().to_string();
+        let window_id = observation.window_id();
         let delivery_attestation = observation.delivery_attestation();
         let expected_dimensions = observation.geometry().png_size_pixels();
         let expected_sha256 = observation.png_sha256().to_string();
@@ -1596,7 +1684,7 @@ impl SessionActor {
         };
         drop(receipt);
 
-        let (response, metrics) = match sampled {
+        let (mut response, metrics) = match sampled {
             Ok(completed) => completed,
             Err(_) => {
                 self.invalidate_computer_use_session_for_workflow(&workflow_id)
@@ -1675,6 +1763,10 @@ impl SessionActor {
                         .await;
                     return Err(self.fail_protected_computer_use_turn("action_lease").await);
                 }
+                self.mcp_state
+                    .lock()
+                    .await
+                    .clear_computer_use_binding_recovery(&workflow_id);
             }
             Ok(ProtectedResponseLease::Release) => {
                 if self
@@ -1692,13 +1784,53 @@ impl SessionActor {
                         .await;
                     return Err(self.fail_protected_computer_use_turn("release").await);
                 }
+                if response.tool_calls().is_empty() {
+                    self.mcp_state
+                        .lock()
+                        .await
+                        .clear_computer_use_binding_recovery(&workflow_id);
+                }
             }
-            Err(()) => {
+            Err(binding_error) => {
                 self.invalidate_computer_use_session_for_workflow(&workflow_id)
                     .await;
-                return Err(self
-                    .fail_protected_computer_use_turn("response_binding")
-                    .await);
+                let can_recover = self
+                    .mcp_state
+                    .lock()
+                    .await
+                    .claim_computer_use_binding_recovery(&workflow_id);
+                if !can_recover {
+                    self.mcp_state
+                        .lock()
+                        .await
+                        .clear_computer_use_binding_recovery(&workflow_id);
+                    tracing::warn!(
+                        reason = binding_error.code(),
+                        "protected computer-use response-binding recovery exhausted"
+                    );
+                    return Err(self
+                        .fail_protected_computer_use_turn("response_binding_recovery_exhausted")
+                        .await);
+                }
+
+                tracing::warn!(
+                    reason = binding_error.code(),
+                    "recovering protected computer-use response binding with fresh app state"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "computer_use.response_binding_recovery",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "reason": binding_error.code(),
+                        "attempt": 1,
+                        "max_attempts": 1,
+                    })),
+                );
+                response.items = vec![ConversationItem::assistant_tool_calls(vec![
+                    protected_binding_recovery_call(&bundle_id, window_id),
+                ])];
+                response.message_chunks_emitted = 0;
+                response.doom_loop_signals.clear();
             }
         }
 

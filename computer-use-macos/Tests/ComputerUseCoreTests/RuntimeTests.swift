@@ -80,6 +80,46 @@ final class RuntimeTests: XCTestCase {
         XCTAssertEqual(receipts.receipt("uncertain-action")?.state, .outcomeUnknown)
     }
 
+    func testInvalidKeyIsRejectedBeforeDispatchWithoutConsumingSnapshot() async throws {
+        let receipts = MemoryReceiptStore()
+        let driver = FakeDesktopDriver(receipts: receipts)
+        let runtime = try makeRuntime(driver: driver, receipts: receipts)
+        let state = await runtime.callTool(
+            name: "get_app_state",
+            arguments: ["bundle_id": .string("com.example.fixture")],
+            context: ToolCallContext(clientIdentifier: "client-a")
+        )
+        let carrier = try XCTUnwrap(state.protectedCarrier)
+        _ = await attest(carrier, runtime: runtime, client: "client-a")
+
+        let invalid = await runtime.callTool(
+            name: "press_key",
+            arguments: [
+                "snapshot_id": .string(carrier.snapshotID),
+                "key": .string("HyperArrow"),
+            ],
+            context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "invalid-key")
+        )
+
+        XCTAssertTrue(invalid.isError)
+        XCTAssertTrue(invalid.text.contains("invalid_arguments"))
+        XCTAssertNil(receipts.receipt("invalid-key"))
+        XCTAssertTrue(driver.pressedKeySpecifications.isEmpty)
+
+        let valid = await runtime.callTool(
+            name: "press_key",
+            arguments: [
+                "snapshot_id": .string(carrier.snapshotID),
+                "key": .string("RightArrow"),
+            ],
+            context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "valid-key")
+        )
+
+        XCTAssertFalse(valid.isError)
+        XCTAssertEqual(receipts.receipt("valid-key")?.state, .applied)
+        XCTAssertEqual(driver.pressedKeySpecifications, ["right"])
+    }
+
     func testDesktopLeaseFencesOtherClients() async throws {
         let receipts = MemoryReceiptStore()
         let driver = FakeDesktopDriver(receipts: receipts)
@@ -255,6 +295,7 @@ private final class FakeDesktopDriver: DesktopDriving {
     var clickCount = 0
     var failClick = false
     var sawDurableDispatchBeforeEffect = false
+    var pressedKeySpecifications: [String] = []
     var captureGates: [OneShotGate] = []
     var clickGate: OneShotGate?
 
@@ -310,7 +351,9 @@ private final class FakeDesktopDriver: DesktopDriving {
         to: GlobalScreenPoint
     ) async throws {}
     func typeText(app: AppTarget, expectedGeometry: WindowGeometry, text: String) async throws {}
-    func pressKey(app: AppTarget, expectedGeometry: WindowGeometry, specification: String) async throws {}
+    func pressKey(app: AppTarget, expectedGeometry: WindowGeometry, specification: String) async throws {
+        pressedKeySpecifications.append(specification)
+    }
     func setValue(
         app: AppTarget,
         expectedGeometry: WindowGeometry,

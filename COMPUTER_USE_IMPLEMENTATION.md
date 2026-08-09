@@ -25,8 +25,8 @@ proxies, and remote campaigns cannot mint or invoke the trusted capability.
 
 ## Pixel coordinate contract
 
-The native app captures one exact window and records both its Quartz global
-rectangle in points and the dimensions of the final bounded PNG. Model
+The native app captures one same-process window and records both its Quartz
+global rectangle in points and the dimensions of the final bounded PNG. Model
 coordinates are continuous PNG edge coordinates with a top-left origin:
 
 ```text
@@ -40,8 +40,10 @@ global_y = capture_origin_y + y * capture_height_points / png_height
 X and Y use independent ratios. There is no rounding, clamping, half-pixel
 offset, Y-axis flip, inferred Retina scale, or identity fallback. Before input
 dispatch, the app revalidates the target process, bundle, window identifier,
-and exact window bounds. Element actions prefer Accessibility semantics; raw
-pixel coordinates are the fallback.
+and bounded window geometry. Acquisition prefers a shared native window ID,
+then uses tolerant geometry and title matching; hidden or minimized windows
+are raised and retried once. Element actions prefer Accessibility semantics;
+raw pixel coordinates are the fallback.
 
 ## Correctness, durability, and concurrency
 
@@ -75,10 +77,13 @@ desktop.
 ## Operator workflow
 
 ```text
-computer-use-macos/scripts/install-app.sh
-grok computer-use status
-grok computer-use enable
+computer-use-macos/scripts/run-local.sh computer-use enable
+computer-use-macos/scripts/run-local.sh
 ```
+
+The local launcher uses Grok's existing login/session flow. It incrementally
+builds Grok, installs a consistently signed companion only when needed, and
+does not introduce a separate API-key prompt.
 
 Production release certification requires a stable Developer ID identity, an
 expected team identifier, and an `notarytool` keychain profile. The
@@ -98,11 +103,13 @@ assembly, and ad-hoc seal checks on an Apple Silicon macOS runner.
 - `computer-use-macos/Sources/ComputerUseCore/ComputerUseRuntime.swift`
 - `computer-use-macos/Sources/ComputerUseCore/Geometry.swift`
 - `computer-use-macos/Sources/ComputerUseCore/HostSigningPolicy.swift`
+- `computer-use-macos/Sources/ComputerUseCore/KeyboardInput.swift`
 - `computer-use-macos/Sources/ComputerUseCore/MCPServer.swift`
 - `computer-use-macos/Sources/ComputerUseCore/Models.swift`
 - `computer-use-macos/Sources/ComputerUseCore/RuntimeProtocols.swift`
 - `computer-use-macos/Sources/ComputerUseCore/ToolCatalog.swift`
 - `computer-use-macos/Sources/ComputerUseCore/TransportRecoveryPolicy.swift`
+- `computer-use-macos/Sources/ComputerUseCore/WindowMatching.swift`
 - `computer-use-macos/Sources/GrokComputerUseApp/AgentSocketServer.swift`
 - `computer-use-macos/Sources/GrokComputerUseApp/AppMain.swift`
 - `computer-use-macos/Sources/GrokComputerUseApp/DurableReceiptStore.swift`
@@ -113,8 +120,10 @@ assembly, and ad-hoc seal checks on an Apple Silicon macOS runner.
 - `computer-use-macos/Sources/GrokComputerUseMCP/RelayMain.swift`
 - `computer-use-macos/Tests/ComputerUseCoreTests/GeometryTests.swift`
 - `computer-use-macos/Tests/ComputerUseCoreTests/HostSigningPolicyTests.swift`
+- `computer-use-macos/Tests/ComputerUseCoreTests/KeyboardInputTests.swift`
 - `computer-use-macos/Tests/ComputerUseCoreTests/ProtocolTests.swift`
 - `computer-use-macos/Tests/ComputerUseCoreTests/RuntimeTests.swift`
+- `computer-use-macos/Tests/ComputerUseCoreTests/WindowMatchingTests.swift`
 - `computer-use-macos/scripts/build-app.sh`
 - `computer-use-macos/scripts/certify.sh`
 - `computer-use-macos/scripts/install-app.sh`
@@ -124,7 +133,7 @@ assembly, and ad-hoc seal checks on an Apple Silicon macOS runner.
 
 ### Rust integration and CI
 
-- `.github/workflows/computer-use-macos.yml`
+- `.github/workflows-disabled/computer-use-macos.yml`
 - `crates/codegen/xai-grok-mcp/src/computer_use.rs`
 - `crates/codegen/xai-grok-pager/src/computer_use_cmd.rs`
 - `crates/codegen/xai-grok-sampler/src/protected_overlay.rs`
@@ -178,4 +187,3 @@ Two release boundaries remain explicit:
    an authenticated protocol epoch or high-water mark; deleting rows by age
    would violate the no-retry guarantee. High-volume fleets must monitor the
    receipt database until that extension is implemented.
-

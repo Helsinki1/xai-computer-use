@@ -41,12 +41,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${XAI_API_KEY:-}" ]]; then
-  read -r -s -p "XAI_API_KEY: " XAI_API_KEY
-  echo >&2
-  export XAI_API_KEY
-fi
-
 app_is_stale() {
   [[ ! -x "${app_binary}" ]] && return 0
   find "${component_root}/Sources" "${component_root}/Resources" \

@@ -48,13 +48,13 @@ public enum ToolCatalog {
     public static let all: [ToolDefinition] = [
         ToolDefinition(
             name: "list_apps",
-            description: "List running GUI applications that can be selected for computer use.",
+            description: "List running GUI applications that can be selected for computer use. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(properties: [:], required: []),
             annotations: readOnlyAnnotations
         ),
         ToolDefinition(
             name: "get_app_state",
-            description: "Acquire the serialized desktop lease and return a fresh, server-authoritative screenshot plus accessibility snapshot. Call this before every action sequence.",
+            description: "Acquire the serialized desktop lease and return a fresh, server-authoritative screenshot plus accessibility snapshot. Call this before every action sequence, as the only computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "bundle_id": boundedStringSchema(minimum: 3, maximum: 255),
@@ -66,7 +66,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "click",
-            description: "Consume a snapshot and click either an accessibility element or a point in that snapshot's PNG pixel-edge coordinate space.",
+            description: "Consume a snapshot and click either an accessibility element or a point in that snapshot's PNG pixel-edge coordinate space. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
@@ -82,7 +82,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "perform_secondary_action",
-            description: "Consume a snapshot and invoke a non-primary accessibility action advertised by an element.",
+            description: "Consume a snapshot and invoke a non-primary accessibility action advertised by an element. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
@@ -95,7 +95,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "scroll",
-            description: "Consume a snapshot and scroll at an accessibility element in a cardinal direction.",
+            description: "Consume a snapshot and scroll at an accessibility element in a cardinal direction. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
@@ -113,7 +113,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "drag",
-            description: "Consume a snapshot and drag between two points in its PNG pixel-edge coordinate space.",
+            description: "Consume a snapshot and drag between two points in its PNG pixel-edge coordinate space. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
@@ -126,7 +126,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "type_text",
-            description: "Consume a snapshot and type literal text into its target application. Text is never logged or written to receipts.",
+            description: "Consume a snapshot and type literal text into its target application. Text is never logged or written to receipts. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
@@ -138,7 +138,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "press_key",
-            description: "Consume a snapshot and press one named key or modifier combination such as cmd+c, Return, or Shift+Tab.",
+            description: "Consume a snapshot and press one named key, with modifiers passed separately. Navigation names include left, right, up, down, home, end, pageup, and pagedown; common aliases such as ArrowRight and RightArrow are accepted. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
@@ -158,7 +158,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "set_value",
-            description: "Consume a snapshot and assign the value of an accessibility element that was marked settable.",
+            description: "Consume a snapshot and assign the value of an accessibility element that was marked settable. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,

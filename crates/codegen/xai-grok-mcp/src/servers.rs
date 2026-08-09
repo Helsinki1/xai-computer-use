@@ -386,6 +386,10 @@ pub struct McpState {
     /// request. Kept in MCP state so session actors do not need a second,
     /// independently-correlated "latest observation" slot.
     pending_computer_use_handoff: Option<ComputerUseObservationHandoff>,
+    /// Workflow currently consuming its one automatic response-binding
+    /// recovery. Kept across the synthetic refresh observation so a model
+    /// cannot loop indefinitely on invalid protected responses.
+    computer_use_binding_recovery_workflow: Option<Box<str>>,
     /// Clients owned by this session; cleared on config changes.
     pub owned_clients: HashMap<McpServerName, Arc<McpClient>>,
     /// Clients inherited from parent via `SharedMcpPool`; never cleared by config changes.
@@ -461,6 +465,7 @@ impl McpState {
             meta_config_map,
             trusted_server: None,
             pending_computer_use_handoff: None,
+            computer_use_binding_recovery_workflow: None,
             owned_clients: HashMap::new(),
             shared_clients: HashMap::new(),
             acp_mcp: None,
@@ -509,6 +514,7 @@ impl McpState {
             previous.observations.invalidate_all();
         }
         self.pending_computer_use_handoff = None;
+        self.computer_use_binding_recovery_workflow = None;
         self.trusted_server = Some(TrustedMcpServerSpec::new(profile, relay_path));
         self.owned_clients.remove(COMPUTER_USE_MCP_SERVER_NAME);
         self.shared_clients
@@ -583,6 +589,24 @@ impl McpState {
     /// available anywhere in the capability-bearing path.
     pub fn take_computer_use_handoff(&mut self) -> Option<ComputerUseObservationHandoff> {
         self.pending_computer_use_handoff.take()
+    }
+
+    /// Claim the one response-binding recovery allowed for this workflow.
+    /// Returns false when the same workflow already consumed that recovery.
+    pub fn claim_computer_use_binding_recovery(&mut self, workflow_id: &str) -> bool {
+        if self.computer_use_binding_recovery_workflow.as_deref() == Some(workflow_id) {
+            return false;
+        }
+        self.computer_use_binding_recovery_workflow = Some(workflow_id.into());
+        true
+    }
+
+    /// Complete or abandon recovery for this workflow. A different workflow
+    /// is never cleared accidentally.
+    pub fn clear_computer_use_binding_recovery(&mut self, workflow_id: &str) {
+        if self.computer_use_binding_recovery_workflow.as_deref() == Some(workflow_id) {
+            self.computer_use_binding_recovery_workflow = None;
+        }
     }
 
     /// Destroy every in-memory protected observation and any armed handoff.
@@ -5030,6 +5054,21 @@ mod tests {
         state.invalidate_computer_use_handoff();
         assert!(state.take_computer_use_handoff().is_none());
         assert_eq!(carrier.pending_len(), 0);
+    }
+
+    #[test]
+    fn computer_use_binding_recovery_is_bounded_per_workflow() {
+        let mut state = McpState::new(Vec::new());
+        assert!(state.claim_computer_use_binding_recovery("workflow-a"));
+        assert!(!state.claim_computer_use_binding_recovery("workflow-a"));
+
+        // Clearing another workflow cannot replenish the active budget.
+        state.clear_computer_use_binding_recovery("workflow-b");
+        assert!(!state.claim_computer_use_binding_recovery("workflow-a"));
+
+        state.clear_computer_use_binding_recovery("workflow-a");
+        assert!(state.claim_computer_use_binding_recovery("workflow-a"));
+        assert!(state.claim_computer_use_binding_recovery("workflow-b"));
     }
 
     #[tokio::test]

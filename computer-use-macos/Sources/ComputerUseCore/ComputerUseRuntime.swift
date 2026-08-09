@@ -36,7 +36,7 @@ public actor ComputerUseRuntime: ToolCalling {
         receipts: any ActionReceiptStoring,
         clock: any RuntimeClock = SystemRuntimeClock(),
         identifiers: any IdentifierGenerating = UUIDIdentifierGenerator(),
-        leaseDuration: TimeInterval = 30
+        leaseDuration: TimeInterval = 120
     ) throws {
         guard leaseDuration.isFinite, leaseDuration > 0 else {
             throw ComputerUseError.invalidArguments("The desktop lease duration must be finite and positive.")
@@ -321,7 +321,7 @@ public actor ComputerUseRuntime: ToolCalling {
         guard modifiers.count == Set(modifiers).count, Set(modifiers).isSubset(of: allowed) else {
             throw ComputerUseError.invalidArguments("modifiers is invalid.")
         }
-        let specification = (modifiers + [key]).joined(separator: "+")
+        let specification = try KeyboardShortcut.canonicalSpecification(key: key, modifiers: modifiers)
         let driver = self.driver
         return try await dispatchAction(toolName: "press_key", snapshotID: snapshotID, context: context) { record in
             let captured = record.envelope.captured

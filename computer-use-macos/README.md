@@ -27,11 +27,12 @@ computer-use-macos/scripts/run-local.sh computer-use enable
 computer-use-macos/scripts/run-local.sh
 ```
 
-`run-local.sh` prompts for `XAI_API_KEY` when it is not already exported,
-installs a debug app only when it is missing or stale, uses Cargo's incremental
-build, and then launches Grok. Pass `--rebuild` to reinstall the app
-unconditionally, or `--no-rebuild` to launch only the existing artifacts.
-Arguments after `--` are passed to Grok.
+`run-local.sh` uses Grok's normal login flow and reuses an existing Grok
+session. An exported `XAI_API_KEY` remains supported, but the launcher does not
+require or prompt for one. It installs a debug app only when it is missing or
+stale, uses Cargo's incremental build, and then launches Grok. Pass `--rebuild`
+to reinstall the app unconditionally, or `--no-rebuild` to launch only the
+existing artifacts. Arguments after `--` are passed to Grok.
 
 Approve Accessibility and Screen Recording for **Grok Computer Use** when
 macOS prompts, then restart both the app and Grok. Local mode still requires
@@ -64,7 +65,7 @@ There is no half-pixel offset, clamp, rounding, Y flip, backing-scale inference,
 - Action receipts use a no-symlink, private SQLite database and validated WAL/SHM sidecars with `synchronous=FULL`, `fullfsync=ON`, and Keychain-backed HMAC-SHA256 authentication. State is `prepared -> dispatched -> applied|rejected`; a stranded or uncertain dispatch becomes `outcome_unknown` and is never retried.
 - Screenshot bytes and bounded AX observation text exist only in the reserved protected MCP carrier. Rust verifies and removes that carrier before ordinary tool output, logs, hooks, replay, or caches see it. Text-entry values and tool arguments are never written to receipts or logs.
 
-The AX walk has node, depth, elapsed-time, per-string, action-count, and total-observation limits. ScreenCaptureKit operations have five-second deadlines. Every input revalidates the exact captured window; text entry additionally requires an editable focused AX element. Secure text values are always redacted.
+The AX walk has node, depth, elapsed-time, per-string, action-count, and total-observation limits. ScreenCaptureKit operations have five-second deadlines. Snapshot acquisition follows the recovery-oriented Open Computer Use approach: it prefers native window IDs, tolerates small AX/ScreenCaptureKit frame differences, and can raise or unminimize a same-process window before retrying. Every input still revalidates the captured PID, bundle, window ID, and bounded geometry; text entry additionally requires an editable focused AX element. Secure text values are always redacted.
 
 ## Current operational limit
 

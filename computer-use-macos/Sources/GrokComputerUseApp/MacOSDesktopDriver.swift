@@ -17,6 +17,7 @@ final class MacOSDesktopDriver: DesktopDriving {
     private static let maximumAXActions = 16
     private static let maximumAXActionBytes = 128
     private static let accessibilityDeadlineNanoseconds: UInt64 = 150_000_000
+    private static let windowRecoveryDelay: Duration = .milliseconds(700)
     private static let maximumPNGBytes = 900_000
     private static let maximumPNGDimension = 1_280
     private static let maximumPNGPixelCount = 1_638_400
@@ -62,19 +63,12 @@ final class MacOSDesktopDriver: DesktopDriving {
         }
         let selected: NSRunningApplication
         if let windowIdentifier {
-            guard let requestedWindow = content.windows.first(where: {
+            let ownerPID = content.windows.first(where: {
                 $0.windowID == windowIdentifier && isCapturable($0)
-            }),
-                  let owner = requestedWindow.owningApplication,
-                  let matchingApplication = candidates.first(where: {
-                      $0.processIdentifier == owner.processID
-                  })
-            else {
-                throw ComputerUseError.stateUnavailable(
-                    "The requested window does not belong to a running instance of the selected bundle identifier."
-                )
-            }
-            selected = matchingApplication
+            })?.owningApplication?.processID
+            selected = candidates.first(where: { $0.processIdentifier == ownerPID })
+                ?? candidates.first(where: \.isActive)
+                ?? candidates[0]
         } else {
             selected = candidates.first(where: \.isActive) ?? candidates[0]
         }
@@ -332,7 +326,8 @@ final class MacOSDesktopDriver: DesktopDriving {
         application: NSRunningApplication,
         requestedWindowIdentifier: UInt32?,
         content: SCShareableContent,
-        generation: UInt64
+        generation: UInt64,
+        allowRecovery: Bool = true
     ) async throws -> CapturedDesktopState {
         guard AXIsProcessTrusted() else {
             throw ComputerUseError.permissionDenied("Accessibility permission is required for Grok Computer Use.app.")
@@ -344,6 +339,7 @@ final class MacOSDesktopDriver: DesktopDriving {
         let pid = application.processIdentifier
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, 0.15)
+        enableBestEffortAccessibilityModes(appElement)
         let accessibilityWindows = copyElements(appElement, attribute: kAXWindowsAttribute)
         let focusedWindow = copyElement(appElement, attribute: kAXFocusedWindowAttribute)
         let selectionHint = focusedWindow ?? accessibilityWindows.first
@@ -356,10 +352,21 @@ final class MacOSDesktopDriver: DesktopDriving {
         let window: SCWindow?
         if let requestedWindowIdentifier {
             window = candidates.first(where: { $0.windowID == requestedWindowIdentifier })
+                ?? chooseWindow(candidates, title: focusedTitle, frame: focusedFrame)
         } else {
             window = chooseWindow(candidates, title: focusedTitle, frame: focusedFrame)
         }
         guard let window else {
+            if allowRecovery {
+                try await recoverVisibleWindow(application: application, appElement: appElement)
+                return try await capture(
+                    application: application,
+                    requestedWindowIdentifier: requestedWindowIdentifier,
+                    content: try await shareableContent(),
+                    generation: generation,
+                    allowRecovery: false
+                )
+            }
             throw ComputerUseError.stateUnavailable("The target application has no capturable on-screen window.")
         }
         let bounds = window.frame
@@ -372,12 +379,22 @@ final class MacOSDesktopDriver: DesktopDriving {
         else {
             throw ComputerUseError.stateUnavailable("ScreenCaptureKit returned invalid window geometry.")
         }
-        guard let accessibilityWindow = exactAccessibilityWindow(
+        guard let accessibilityWindow = matchingAccessibilityWindow(
             matching: window,
             candidates: accessibilityWindows
         ) else {
+            if allowRecovery {
+                try await recoverVisibleWindow(application: application, appElement: appElement)
+                return try await capture(
+                    application: application,
+                    requestedWindowIdentifier: requestedWindowIdentifier,
+                    content: try await shareableContent(),
+                    generation: generation,
+                    allowRecovery: false
+                )
+            }
             throw ComputerUseError.stateUnavailable(
-                "The selected ScreenCaptureKit window could not be bound to one exact accessibility window."
+                "Could not pair ScreenCaptureKit window \(window.windowID) with an accessibility window for pid \(pid) (AX windows: \(accessibilityWindows.count))."
             )
         }
 
@@ -579,35 +596,57 @@ final class MacOSDesktopDriver: DesktopDriving {
         window.isOnScreen && window.frame.width > 1 && window.frame.height > 1
     }
 
-    private func exactAccessibilityWindow(
+    private func matchingAccessibilityWindow(
         matching window: SCWindow,
         candidates: [AXUIElement]
     ) -> AXUIElement? {
-        let numbered = candidates.filter {
-            copyUInt32($0, attribute: "AXWindowNumber") == window.windowID
+        let descriptions = candidates.map {
+            AccessibilityWindowCandidate(
+                windowIdentifier: copyUInt32($0, attribute: "AXWindowNumber"),
+                frame: copyFrame($0).map(globalScreenRect),
+                title: copyString($0, attribute: kAXTitleAttribute)
+            )
         }
-        let identityCandidates = numbered.isEmpty ? candidates : numbered
-        let frameMatches = identityCandidates.filter {
-            guard let frame = copyFrame($0) else { return false }
-            return framesAreEqual(frame, window.frame)
+        guard let index = AccessibilityWindowMatcher.matchIndex(
+            windowIdentifier: window.windowID,
+            frame: globalScreenRect(window.frame),
+            title: window.title,
+            candidates: descriptions
+        ) else { return nil }
+        return candidates[index]
+    }
+
+    private func recoverVisibleWindow(
+        application: NSRunningApplication,
+        appElement: AXUIElement
+    ) async throws {
+        _ = application.unhide()
+        _ = application.activate(options: [.activateAllWindows])
+
+        let candidate = copyElement(appElement, attribute: kAXFocusedWindowAttribute)
+            ?? copyElements(appElement, attribute: kAXWindowsAttribute).first
+        if let candidate {
+            if copyBool(candidate, attribute: kAXMinimizedAttribute) == true {
+                _ = AXUIElementSetAttributeValue(
+                    candidate,
+                    kAXMinimizedAttribute as CFString,
+                    kCFBooleanFalse
+                )
+            }
+            _ = AXUIElementPerformAction(candidate, kAXRaiseAction as CFString)
+            _ = AXUIElementSetAttributeValue(
+                candidate,
+                kAXMainAttribute as CFString,
+                kCFBooleanTrue
+            )
+            _ = AXUIElementSetAttributeValue(
+                candidate,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
         }
-        if frameMatches.count == 1 {
-            return frameMatches[0]
-        }
-        // Chromium decorates AX titles with browser/profile suffixes that are
-        // absent from ScreenCaptureKit. Titles are therefore only a secondary
-        // discriminator when exact process, window-number (when available),
-        // and frame matching still leave more than one candidate.
-        guard frameMatches.count > 1,
-              let title = window.title,
-              !title.isEmpty
-        else {
-            return nil
-        }
-        let titleMatches = frameMatches.filter {
-            copyString($0, attribute: kAXTitleAttribute) == title
-        }
-        return titleMatches.count == 1 ? titleMatches[0] : nil
+
+        try await Task.sleep(for: Self.windowRecoveryDelay)
     }
 
     private func revalidate(app: AppTarget, expectedGeometry: WindowGeometry) async throws {
@@ -639,10 +678,29 @@ final class MacOSDesktopDriver: DesktopDriving {
     }
 
     private func framesAreEqual(_ left: CGRect, _ right: CGRect) -> Bool {
-        left.origin.x == right.origin.x
-            && left.origin.y == right.origin.y
-            && left.width == right.width
-            && left.height == right.height
+        AccessibilityWindowMatcher.framesMatch(globalScreenRect(left), globalScreenRect(right))
+    }
+
+    private func globalScreenRect(_ rect: CGRect) -> GlobalScreenRect {
+        GlobalScreenRect(
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
+        _ = AXUIElementSetAttributeValue(
+            appElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        )
+        _ = AXUIElementSetAttributeValue(
+            appElement,
+            "AXEnhancedUserInterface" as CFString,
+            kCFBooleanTrue
+        )
     }
 
     private func chooseWindow(_ windows: [SCWindow], title: String?, frame: CGRect?) -> SCWindow? {
@@ -1062,9 +1120,10 @@ private struct KeySpecification {
         let components = value.split(separator: "+", omittingEmptySubsequences: false).map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
-        guard let keyName = components.last, !keyName.isEmpty else {
+        guard let rawKeyName = components.last, !rawKeyName.isEmpty else {
             throw ComputerUseError.invalidArguments("Invalid key specification.")
         }
+        let keyName = try KeyboardKeyName.canonicalize(rawKeyName)
         var modifiers: [KeyModifier] = []
         var seen = Set<String>()
         for name in components.dropLast() {
