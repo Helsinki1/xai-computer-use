@@ -17,6 +17,38 @@ impl SessionActor {
         }
         self.ensure_mcp_tools_initialized().await;
     }
+    /// Re-advertise the slash command list once background MCP handshakes
+    /// settle, so commands gated on a tool that connects asynchronously
+    /// (e.g. `/computer-use`, gated on the trusted native relay) appear
+    /// once ready instead of only if the initial startup snapshot happened
+    /// to be taken after that handshake finished.
+    ///
+    /// `ensure_mcp_tools_initialized` kicks off per-server handshakes in a
+    /// background task and returns immediately; the very first
+    /// `AvailableCommandsUpdate` sent at session spawn can race ahead of
+    /// that background work. Mirrors the wait used in
+    /// `handle_rebuild_agent_for_definition` (`model_switch.rs`).
+    pub(super) async fn advertise_commands_after_mcp_handshakes(&self) {
+        let notified = self.mcp_handshakes_done.notified();
+        tokio::pin!(notified);
+        let needs_wait = {
+            let s = self.mcp_state.lock().await;
+            (!s.configs.is_empty() || s.has_trusted_computer_use_profile()) && !s.is_initialized()
+        };
+        if needs_wait {
+            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep(TIMEOUT) => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "advertise_commands_after_mcp_handshakes: timed out waiting for MCP handshakes"
+                    );
+                }
+            }
+        }
+        self.send_available_commands_update().await;
+    }
     /// If managed tokens are near expiry, swap clients using the agent-level cache.
     pub(super) async fn refresh_managed_mcp_if_stale(&self) {
         use crate::session::managed_mcp::ManagedMcpCache;

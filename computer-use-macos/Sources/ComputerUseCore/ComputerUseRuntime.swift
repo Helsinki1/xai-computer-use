@@ -161,6 +161,17 @@ public actor ComputerUseRuntime: ToolCalling {
         }
     }
 
+    /// AX roles where a second click reverses the effect of the first
+    /// (checked → unchecked, on → off), so a blind rapid-retry click would
+    /// silently desync the model's belief about the control's state.
+    private static let stateTogglingRoles: Set<String> = [
+        "AXCheckBox",
+        "AXRadioButton",
+        "AXSwitch",
+        "AXToggle",
+        "AXDisclosureTriangle",
+    ]
+
     private func click(arguments: [String: JSONValue], context: ToolCallContext) async throws -> ToolExecutionResult {
         var reader = ArgumentReader(arguments)
         let snapshotID = try reader.requiredString("snapshot_id")
@@ -201,6 +212,14 @@ public actor ComputerUseRuntime: ToolCalling {
             guard let point = element.frame?.center else {
                 throw ComputerUseError.invalidArguments("The selected element has no actionable frame.")
             }
+            // A resolved AX element with no AXPress falls back to a synthetic
+            // point click, which sometimes doesn't register (focus-stealing,
+            // first-click-to-focus UI). A single quiet rapid follow-up click at
+            // the same point recovers most of those without a second model
+            // turn. Skipped for state-toggling roles, where firing twice would
+            // silently flip the control back and desync the model's belief
+            // about its state from reality.
+            let allowRapidRetry = button == .left && count == 1 && !Self.stateTogglingRoles.contains(element.role)
             return try await dispatchAction(toolName: "click", snapshotID: snapshotID, context: context) { _ in
                 try await driver.click(
                     app: captured.app,
@@ -209,6 +228,16 @@ public actor ComputerUseRuntime: ToolCalling {
                     button: button,
                     count: count
                 )
+                if allowRapidRetry {
+                    try await Task.sleep(for: .milliseconds(120))
+                    try await driver.click(
+                        app: captured.app,
+                        expectedGeometry: captured.geometry,
+                        point: point,
+                        button: button,
+                        count: count
+                    )
+                }
             }
         } else if kind == "pixel" {
             let pixel = PNGPixelPoint(

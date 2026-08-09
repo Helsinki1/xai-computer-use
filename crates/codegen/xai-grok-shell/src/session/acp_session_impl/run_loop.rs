@@ -297,6 +297,12 @@ pub(super) async fn run_session(
         SessionActor::maybe_start_running_task(session_for_mcp.clone(), completion_tx_for_mcp)
             .await;
     });
+    let session_for_mcp_advertise = session.clone();
+    tokio::task::spawn_local(async move {
+        session_for_mcp_advertise
+            .advertise_commands_after_mcp_handshakes()
+            .await;
+    });
     let mut model_switch_rx = session.models_manager.subscribe_model_switch();
     let _ = *model_switch_rx.borrow_and_update();
     let idle_flush_sleep = match session.idle_flush_timeout {

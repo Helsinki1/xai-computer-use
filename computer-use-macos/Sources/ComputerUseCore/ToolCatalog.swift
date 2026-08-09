@@ -82,7 +82,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "click",
-            description: "Consume a snapshot and click either an accessibility element or a point in that snapshot's PNG pixel-edge coordinate space. Prefer target.kind=element when a target_candidate matches the intended control and offers AXPress (for example, intent 'open Settings' + candidate label 'Settings' -> click that element). Use target.kind=pixel only when no matching actionable element exists, and only with coordinates from this exact screenshot. Never use a control intended to open System Settings. If the expected effect is absent, acquire fresh state and re-identify the target; do not replay an uncertain action. Issue exactly one computer-use tool call in this model turn.",
+            description: "Consume a snapshot and click either an accessibility element or a point in that snapshot's PNG pixel-edge coordinate space. Prefer target.kind=element when a target_candidate matches the intended control and offers AXPress (for example, intent 'open Settings' + candidate label 'Settings' -> click that element). Use target.kind=pixel only when no matching actionable element exists, and only with coordinates from this exact screenshot. For a small, dense, or ambiguous target where you are not confident of the exact point or element, call plan_click first to resolve and confirm it before dispatching. Never use a control intended to open System Settings. If the expected effect is absent, acquire fresh state and re-identify the target; do not replay an uncertain action. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,
