@@ -24,6 +24,7 @@ image = (
     .apt_install(
         "build-essential",
         "ca-certificates",
+        "chromium",
         "curl",
         "novnc",
         "openbox",
@@ -49,7 +50,7 @@ image = (
         "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.94.0",
         f"bash -lc 'source /root/.cargo/env && cd {REMOTE_SUBTREE} && cargo build --release'",
         f"bash -lc 'cd {REMOTE_SUBTREE} && ./scripts/install.sh'",
-        f"chmod +x {REMOTE_SUBTREE}/scripts/start_modal_x11_demo.sh {REMOTE_SUBTREE}/scripts/mcp_smoke_test.py",
+        f"chmod +x {REMOTE_SUBTREE}/scripts/start_modal_x11_demo.sh {REMOTE_SUBTREE}/scripts/mcp_smoke_test.py {REMOTE_SUBTREE}/scripts/modal_restaurant_demo.py",
     )
 )
 
@@ -166,7 +167,7 @@ def smoke_test() -> str:
 )
 def tail_logs() -> str:
     lines: list[str] = []
-    for name in ["daemon.log", "openbox.log", "x11vnc.log", "xvfb.log"]:
+    for name in ["browser.log", "daemon.log", "demo.log", "openbox.log", "x11vnc.log", "xvfb.log"]:
         path = Path(LOG_DIR) / name
         if path.exists():
             lines.append(f"== {name} ==")

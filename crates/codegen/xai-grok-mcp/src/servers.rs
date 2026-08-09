@@ -503,9 +503,7 @@ impl McpState {
         profile: TrustedMcpProfile,
         relay_path: PathBuf,
     ) -> Result<(), McpError> {
-        if !relay_path.is_absolute()
-            || !relay_path.ends_with(crate::computer_use::TRUSTED_RELAY_PATH_SUFFIX)
-        {
+        if !crate::computer_use::trusted_relay_path_matches(&relay_path) {
             return Err(McpError::ClientError(
                 "trusted computer-use relay path does not match the reserved app relay".to_string(),
             ));

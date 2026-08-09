@@ -36,6 +36,7 @@ require_binary() {
 }
 
 require_binary Xvfb
+require_binary chromium
 require_binary openbox
 require_binary xterm
 require_binary x11vnc
@@ -78,6 +79,15 @@ xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 || {
 openbox >"${LOG_ROOT}/openbox.log" 2>&1 &
 sleep 2
 
+chromium \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --disable-gpu \
+  --start-maximized \
+  --new-window \
+  "about:blank" \
+  >"${LOG_ROOT}/browser.log" 2>&1 &
+
 touch "${LOG_ROOT}/daemon.log"
 "${INSTALL_DIR}/grok-computer-use-daemon" >"${LOG_ROOT}/daemon.log" 2>&1 &
 DAEMON_PID=$!
@@ -99,6 +109,8 @@ done
     fi
     exit 1
 }
+
+python3 "${HOME}/computer-use-linux/scripts/modal_restaurant_demo.py" >"${LOG_ROOT}/demo.log" 2>&1 &
 
 x11vnc \
   -display "${DISPLAY}" \
