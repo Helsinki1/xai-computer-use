@@ -175,12 +175,17 @@ pub fn bind_invocation_context(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComputerUseToolClass {
     Observation,
+    /// Reads a delivered snapshot as a planning hint and returns a fresh,
+    /// protected visual observation. It must retain the supplied snapshot
+    /// until the native tool has consumed that hint.
+    Planning,
     Effectful,
 }
 
 pub fn classify_tool(name: &str) -> Option<ComputerUseToolClass> {
     match name {
-        "list_apps" | "get_app_state" | "plan_click" => Some(ComputerUseToolClass::Observation),
+        "list_apps" | "get_app_state" => Some(ComputerUseToolClass::Observation),
+        "plan_click" => Some(ComputerUseToolClass::Planning),
         "click"
         | "drag"
         | "perform_secondary_action"

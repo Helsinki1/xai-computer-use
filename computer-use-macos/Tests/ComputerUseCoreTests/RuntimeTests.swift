@@ -78,12 +78,15 @@ final class RuntimeTests: XCTestCase {
             try XCTUnwrap(plan.protectedCarrier).pngSHA256,
             SHA256.hash(data: preview).map { String(format: "%02x", $0) }.joined()
         )
+        let plannedCarrier = try XCTUnwrap(plan.protectedCarrier)
+        let plannedAttestation = await attest(plannedCarrier, runtime: runtime, client: "client-a")
+        XCTAssertFalse(plannedAttestation.isError)
         XCTAssertEqual(driver.clickCount, 0)
 
         let click = await runtime.callTool(
             name: "click",
             arguments: [
-                "snapshot_id": .string(carrier.snapshotID),
+                "snapshot_id": .string(plannedCarrier.snapshotID),
                 "target": .object(["kind": .string("element"), "element_id": .string("e1")]),
             ],
             context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "planned-click")
