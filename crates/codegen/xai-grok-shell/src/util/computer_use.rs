@@ -2,18 +2,44 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 pub const APP_BUNDLE_NAME: &str = "Grok Computer Use.app";
+#[cfg(target_os = "macos")]
 pub const RELAY_RELATIVE_PATH: &str = "Contents/MacOS/grok-computer-use-mcp";
+#[cfg(target_os = "linux")]
+pub const RELAY_RELATIVE_PATH: &str = "grok-computer-use-mcp";
 pub const APP_SIGNING_IDENTIFIER: &str = "com.xai.grok.computer-use";
 pub const RELAY_SIGNING_IDENTIFIER: &str = "com.xai.grok.computer-use.mcp";
 pub const LOCAL_DEVELOPMENT_ENV: &str = "GROK_COMPUTER_USE_LOCAL_DEV";
+pub const LINUX_INSTALL_DIR_NAME: &str = "grok-computer-use";
 
-pub fn app_bundle_path() -> Option<PathBuf> {
+#[cfg(target_os = "macos")]
+pub fn installation_root_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join("Applications").join(APP_BUNDLE_NAME))
 }
 
+#[cfg(target_os = "linux")]
+pub fn installation_root_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| {
+        home.join(".local")
+            .join("libexec")
+            .join(LINUX_INSTALL_DIR_NAME)
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn installation_root_path() -> Option<PathBuf> {
+    None
+}
+
+pub fn app_bundle_path() -> Option<PathBuf> {
+    installation_root_path()
+}
+
 pub fn relay_path() -> Option<PathBuf> {
-    app_bundle_path().map(|app| app.join(RELAY_RELATIVE_PATH))
+    installation_root_path().map(|root| root.join(RELAY_RELATIVE_PATH))
 }
 
 /// Every existing component from the relay through the filesystem root must
@@ -36,6 +62,11 @@ pub fn local_development_enabled() -> bool {
         && std::env::var_os(LOCAL_DEVELOPMENT_ENV).is_some_and(|value| value == "1")
 }
 
+#[cfg(target_os = "linux")]
+fn x11_session_supported() -> bool {
+    std::env::var_os("XDG_SESSION_TYPE").is_some_and(|value| value == "x11")
+}
+
 #[cfg(target_os = "macos")]
 pub fn platform_supported() -> bool {
     if !cfg!(target_arch = "aarch64") && !local_development_enabled() {
@@ -51,7 +82,12 @@ pub fn platform_supported() -> bool {
         .is_some_and(|major| major >= 14)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn platform_supported() -> bool {
+    x11_session_supported()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn platform_supported() -> bool {
     false
 }
@@ -124,9 +160,25 @@ fn code_signature_identity(path: &Path) -> Option<CodeSignatureIdentity> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn signature_valid(_app: &Path) -> bool {
     false
+}
+
+#[cfg(target_os = "linux")]
+fn path_owned_by_current_user(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.uid() == unsafe { libc::geteuid() })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+pub fn signature_valid(install_root: &Path) -> bool {
+    let relay = install_root.join(RELAY_RELATIVE_PATH);
+    install_root.is_dir()
+        && relay.is_file()
+        && path_owned_by_current_user(install_root)
+        && path_owned_by_current_user(&relay)
 }
 
 /// Return the one permitted relay executable only when the current install is
@@ -136,12 +188,12 @@ pub fn trusted_relay_path() -> Option<PathBuf> {
     if !platform_supported() {
         return None;
     }
-    let app = app_bundle_path()?;
-    let relay = app.join(RELAY_RELATIVE_PATH);
-    if !app.is_dir()
+    let install_root = installation_root_path()?;
+    let relay = install_root.join(RELAY_RELATIVE_PATH);
+    if !install_root.is_dir()
         || !relay.is_file()
-        || !path_chain_has_no_symlinks(&app, &relay)
-        || !signature_valid(&app)
+        || !path_chain_has_no_symlinks(&install_root, &relay)
+        || !signature_valid(&install_root)
     {
         return None;
     }

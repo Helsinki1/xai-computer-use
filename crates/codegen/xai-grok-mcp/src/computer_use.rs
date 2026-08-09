@@ -25,10 +25,20 @@ pub const COMPUTER_USE_MCP_SERVER_NAME: &str = "xai_computer_use";
 pub const COMPUTER_USE_V2_PROFILE_NAME: &str = "computer-use-v2";
 /// Protocol `_meta` key used in both calls and snapshot-bearing results.
 pub const COMPUTER_USE_V2_META_KEY: &str = "xai/computer-use-v2";
-/// Suffix enforced by the MCP capability constructor. The shell additionally
-/// verifies this bundle/path has no symlink components and a valid signature.
-pub const TRUSTED_RELAY_PATH_SUFFIX: &str =
+/// Reserved macOS suffix enforced by the MCP capability constructor. The shell
+/// additionally verifies this bundle/path has no symlink components and a
+/// valid platform trust decision.
+pub const MACOS_TRUSTED_RELAY_PATH_SUFFIX: &str =
     "Grok Computer Use.app/Contents/MacOS/grok-computer-use-mcp";
+/// Reserved Linux install suffix enforced by the MCP capability constructor.
+pub const LINUX_TRUSTED_RELAY_PATH_SUFFIX: &str =
+    ".local/libexec/grok-computer-use/grok-computer-use-mcp";
+
+pub fn trusted_relay_path_matches(path: &Path) -> bool {
+    path.is_absolute()
+        && (path.ends_with(MACOS_TRUSTED_RELAY_PATH_SUFFIX)
+            || path.ends_with(LINUX_TRUSTED_RELAY_PATH_SUFFIX))
+}
 /// Hidden relay method called only after final inference-body attestation succeeds.
 pub const ATTEST_SNAPSHOT_DELIVERY_TOOL: &str = "attest_snapshot_delivery";
 /// Hidden relay method used to invalidate all leases for a session.
@@ -217,6 +227,27 @@ pub(crate) fn should_capture_observation(
 
 pub fn is_reserved_server_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(COMPUTER_USE_MCP_SERVER_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_relay_path_matcher_accepts_reserved_macos_and_linux_paths_only() {
+        assert!(trusted_relay_path_matches(Path::new(
+            "/Users/test/Applications/Grok Computer Use.app/Contents/MacOS/grok-computer-use-mcp"
+        )));
+        assert!(trusted_relay_path_matches(Path::new(
+            "/home/test/.local/libexec/grok-computer-use/grok-computer-use-mcp"
+        )));
+        assert!(!trusted_relay_path_matches(Path::new(
+            "/tmp/grok-computer-use-mcp"
+        )));
+        assert!(!trusted_relay_path_matches(Path::new(
+            "relative/grok-computer-use-mcp"
+        )));
+    }
 }
 
 /// Fail-closed contract errors contain no server-provided values.

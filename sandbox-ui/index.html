@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Northstar Ops</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Northstar Ops</p>
+        <h1>Incident routing without the spreadsheet cleanup.</h1>
+        <p class="lede">
+          Lightweight mock app for local browser demos. Sign in with the demo
+          account to open the operator dashboard.
+        </p>
+        <div class="credentials">
+          <span>email</span>
+          <span>launchpad</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <form id="login-form" class="card">
+          <div class="card-header">
+            <h2>Log in</h2>
+            <p>Use the shared operator account.</p>
+          </div>
+
+          <label for="email">Email</label>
+          <input
+            id="email"
+            name="email"
+            type="email"
+            autocomplete="username"
+            value="email"
+          />
+
+          <label for="password">Password</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            value="launchpad"
+          />
+
+          <button type="submit">Open dashboard</button>
+          <p id="status" class="status" aria-live="polite"></p>
+        </form>
+
+        <section id="dashboard" class="card dashboard hidden" aria-live="polite">
+          <div class="card-header">
+            <h2>Ops dashboard</h2>
+            <p>Current queues and launch readiness.</p>
+          </div>
+
+          <div class="stats">
+            <article>
+              <span class="stat-label">Active agents</span>
+              <strong>12</strong>
+            </article>
+            <article>
+              <span class="stat-label">Tickets triaged</span>
+              <strong>48</strong>
+            </article>
+            <article>
+              <span class="stat-label">Pending escalations</span>
+              <strong>3</strong>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

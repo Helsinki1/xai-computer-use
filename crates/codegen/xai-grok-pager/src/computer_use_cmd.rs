@@ -49,7 +49,7 @@ pub async fn run(args: ComputerUseArgs) -> Result<()> {
 }
 
 fn app_bundle_path() -> Result<PathBuf> {
-    xai_grok_shell::util::computer_use::app_bundle_path()
+    xai_grok_shell::util::computer_use::installation_root_path()
         .ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))
 }
 
@@ -84,6 +84,11 @@ fn run_status(json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
+        let install_label = if cfg!(target_os = "linux") {
+            "install root"
+        } else {
+            "app"
+        };
         println!("Computer Use");
         println!("  supported: {}", status.supported);
         println!("  local development: {}", status.local_development);
@@ -92,7 +97,8 @@ fn run_status(json: bool) -> Result<()> {
         println!("  secure path: {}", status.secure_path);
         println!("  signature valid: {}", status.signature_valid);
         println!("  ready: {}", status.ready);
-        println!("  app: {}", status.app_path);
+        println!("  {install_label}: {}", status.app_path);
+        println!("  relay: {}", status.relay_path);
     }
     Ok(())
 }
@@ -100,15 +106,26 @@ fn run_status(json: bool) -> Result<()> {
 async fn run_enable() -> Result<()> {
     let status = collect_status()?;
     if !status.supported {
+        if cfg!(target_os = "linux") {
+            bail!("computer use requires a local X11 session on Linux");
+        }
         bail!("computer use requires Apple Silicon and macOS 14 or newer");
     }
     if !status.installed {
+        if cfg!(target_os = "linux") {
+            bail!("grok-computer-use-mcp is not installed in ~/.local/libexec/grok-computer-use");
+        }
         bail!("Grok Computer Use.app is not installed in ~/Applications");
     }
     if !status.secure_path {
-        bail!("computer-use app or relay path contains a symbolic link");
+        bail!("computer-use install root or relay path contains a symbolic link");
     }
     if !status.signature_valid {
+        if cfg!(target_os = "linux") {
+            bail!(
+                "computer-use relay is not owned by the current user at the reserved install path"
+            );
+        }
         bail!("computer-use app failed code-signing or Gatekeeper verification");
     }
     xai_grok_shell::util::config::save_computer_use_enabled(true).await?;

@@ -1,0 +1,5 @@
+[toolchain]
+# Keep in lockstep with the repository root rust-toolchain.toml.
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+profile = "default"
