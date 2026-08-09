@@ -381,6 +381,28 @@ impl SessionActor {
                             }
                         }
                     }
+                    BuiltinAction::ComputerUse { task } => {
+                        if task.is_empty() {
+                            self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                            self.mark_front_message_committed().await;
+                            self.send_host_turn_slash_command_output(
+                                "Usage: /computer-use <what to do on the desktop>\nControls a Mac \
+                                 app through the native computer-use capability. Actions are \
+                                 observed and dispatched one at a time against a fresh desktop \
+                                 snapshot.",
+                            )
+                            .await;
+                            return ok_end_turn(0, None);
+                        }
+                        xai_grok_telemetry::session_ctx::log_event(slash_used);
+                        // Flow through to inference: the model still selects and
+                        // sequences the tools, this only frames the request so the
+                        // desktop capability is the intended route.
+                        vec![text_block(format!(
+                            "Use the computer-use desktop capability to do the following on this \
+                             Mac:\n\n{task}"
+                        ))]
+                    }
                     BuiltinAction::WorkflowLaunch { name, input } => {
                         self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
                         self.mark_front_message_committed().await;

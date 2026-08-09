@@ -1335,6 +1335,17 @@ impl SessionActor {
                 n == xai_grok_tools::implementations::grok_build::workflow::WORKFLOW_TOOL_NAME
             }),
             workflow_management: has_workflow_runs,
+            // Reserved capability: the name cannot be minted by generic MCP
+            // configuration, so a registered tool under it means the native
+            // desktop stack connected and passed catalog verification.
+            computer_use: tool_names.iter().any(|n| {
+                xai_grok_mcp::servers::parse_mcp_qualified_name(n).is_some_and(
+                    |(_, server, tool)| {
+                        xai_grok_mcp::computer_use::is_reserved_server_name(server)
+                            && xai_grok_mcp::computer_use::classify_tool(tool).is_some()
+                    },
+                )
+            }),
         }
     }
     /// Names of every tool registered with the session's tool bridge.

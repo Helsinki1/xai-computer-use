@@ -800,6 +800,11 @@ impl SessionActor {
             BuiltinAction::GoalSet { .. } => {
                 unreachable!("GoalSet is intercepted in handle_prompt")
             }
+            // Intercepted in handle_prompt so the turn continues into model
+            // inference rather than ending here.
+            BuiltinAction::ComputerUse { .. } => {
+                unreachable!("ComputerUse is intercepted in handle_prompt")
+            }
             BuiltinAction::DeepResearch { query } => {
                 if query.is_empty() {
                     self.send_host_turn_slash_command_output(

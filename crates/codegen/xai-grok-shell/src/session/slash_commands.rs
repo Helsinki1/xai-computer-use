@@ -42,6 +42,10 @@ pub(crate) enum BuiltinGate {
     Goal,
     WorkflowLaunches,
     WorkflowManagement,
+    /// The reserved `xai_computer_use` tools are registered this session.
+    /// Gates `/computer-use` so the command is hidden when the native
+    /// desktop capability is absent, disabled, or not yet ready.
+    ComputerUse,
 }
 /// All built-in slash commands. Order here = display order in autocomplete.
 pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -233,6 +237,16 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         },
     },
     BuiltinCommand {
+        name: "computer-use",
+        description: "Control a Mac app through the native computer-use desktop capability",
+        argument_hint: Some("<what to do on the desktop>"),
+        aliases: &[],
+        gate: BuiltinGate::ComputerUse,
+        resolve: |args| BuiltinAction::ComputerUse {
+            task: args.trim().to_string(),
+        },
+    },
+    BuiltinCommand {
         name: "deep-research",
         description: "Research with bounded parallel agents, cross-check evidence, and write a cited report",
         argument_hint: Some("<query>"),
@@ -366,6 +380,10 @@ pub(crate) struct CommandAvailability {
     pub goal: bool,
     pub workflows: bool,
     pub workflow_management: bool,
+    /// The session registered the reserved computer-use toolset. Gates
+    /// `/computer-use`; generic MCP configuration cannot set this because
+    /// the capability name is reserved by the shell.
+    pub computer_use: bool,
 }
 impl CommandAvailability {
     /// `true` if commands gated on `gate` should be advertised this session.
@@ -381,6 +399,7 @@ impl CommandAvailability {
             BuiltinGate::Goal => self.goal,
             BuiltinGate::WorkflowLaunches => self.workflows,
             BuiltinGate::WorkflowManagement => self.workflows || self.workflow_management,
+            BuiltinGate::ComputerUse => self.computer_use,
         }
     }
     /// Test helper: every gate satisfied (matches the legacy "feedback only"
@@ -397,6 +416,7 @@ impl CommandAvailability {
             goal: true,
             workflows: true,
             workflow_management: true,
+            computer_use: true,
         }
     }
 }
@@ -437,6 +457,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "cloud",
     "compact",
     "compact-mode",
+    "computer-use",
     "config",
     "config-agents",
     "context",
@@ -1231,6 +1252,9 @@ pub(super) enum BuiltinAction {
     DeepResearch {
         query: String,
     },
+    ComputerUse {
+        task: String,
+    },
     WorkflowManage {
         run_id: String,
         op: String,
@@ -1271,6 +1295,7 @@ impl BuiltinAction {
             | BuiltinAction::GoalResume
             | BuiltinAction::GoalClear => "goal",
             BuiltinAction::DeepResearch { .. } => "deep-research",
+            BuiltinAction::ComputerUse { .. } => "computer-use",
             BuiltinAction::WorkflowManage { .. } => "workflow",
             BuiltinAction::WorkflowLaunch { .. } => "workflow",
         }
@@ -1305,6 +1330,7 @@ impl BuiltinAction {
             | BuiltinAction::GoalResume
             | BuiltinAction::GoalClear => false,
             BuiltinAction::DeepResearch { .. } => true,
+            BuiltinAction::ComputerUse { task } => !task.is_empty(),
             BuiltinAction::WorkflowManage { .. } => true,
             BuiltinAction::WorkflowLaunch { input, .. } => !input.is_empty(),
         }
