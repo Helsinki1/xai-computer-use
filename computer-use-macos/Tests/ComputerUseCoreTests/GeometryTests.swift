@@ -46,4 +46,27 @@ final class GeometryTests: XCTestCase {
         )
         XCTAssertThrowsError(try CoordinateMapper.globalPoint(for: PNGPixelPoint(x: 1, y: 1), in: geometry))
     }
+
+    func testAccessibilityFrameProjectsIntoAndClipsToScreenshot() throws {
+        let geometry = WindowGeometry(
+            windowIdentifier: 1,
+            globalBoundsPoints: GlobalScreenRect(x: 100, y: 200, width: 400, height: 200),
+            pngWidthPixels: 800,
+            pngHeightPixels: 400
+        )
+
+        XCTAssertEqual(
+            CoordinateMapper.pngRect(
+                for: GlobalScreenRect(x: 80, y: 220, width: 80, height: 40),
+                in: geometry
+            ),
+            PNGPixelRect(x: 0, y: 40, width: 120, height: 80)
+        )
+        XCTAssertNil(
+            CoordinateMapper.pngRect(
+                for: GlobalScreenRect(x: 0, y: 0, width: 10, height: 10),
+                in: geometry
+            )
+        )
+    }
 }

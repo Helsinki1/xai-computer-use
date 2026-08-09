@@ -1,4 +1,7 @@
+import CoreGraphics
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 public actor ComputerUseRuntime: ToolCalling {
     private struct Lease {
@@ -13,6 +16,7 @@ public actor ComputerUseRuntime: ToolCalling {
         let fence: UInt64
         var consumed: Bool
         var deliveryAttested: Bool
+        var allowedDeliverySHA256: Set<String>
     }
 
     private struct InFlightOperation {
@@ -60,6 +64,8 @@ public actor ComputerUseRuntime: ToolCalling {
                 return try await listApps(arguments: arguments)
             case "get_app_state":
                 return try await getAppState(arguments: arguments, clientIdentifier: context.clientIdentifier)
+            case "plan_click":
+                return try await planClick(arguments: arguments, context: context)
             case "click":
                 return try await click(arguments: arguments, context: context)
             case "perform_secondary_action":
@@ -106,7 +112,9 @@ public actor ComputerUseRuntime: ToolCalling {
     private func listApps(arguments: [String: JSONValue]) async throws -> ToolExecutionResult {
         var reader = ArgumentReader(arguments)
         try reader.finish()
-        let apps = try await driver.listApps()
+        let apps = try await driver.listApps().filter {
+            !AppAccessPolicy.isBlocked(bundleIdentifier: $0.bundleIdentifier)
+        }
         var text = "running_apps=\(apps.count)\n"
         for app in apps {
             let windowIDs = app.windowIdentifiers.map(String.init).joined(separator: ",")
@@ -127,6 +135,7 @@ public actor ComputerUseRuntime: ToolCalling {
         else {
             throw ComputerUseError.invalidArguments("bundle_id or window_id is outside the v2 contract.")
         }
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: bundleIdentifier)
 
         let activeLease = try acquireLease(for: clientIdentifier)
         do {
@@ -164,7 +173,8 @@ public actor ComputerUseRuntime: ToolCalling {
         guard let button = MouseButton(rawValue: buttonName), button != .middle, (1...2).contains(count) else {
             throw ComputerUseError.invalidArguments("button or count is invalid.")
         }
-        let captured = try validatedSnapshot(identifier: snapshotID, ownerIdentifier: context.clientIdentifier).envelope.captured
+        let record = try validatedSnapshot(identifier: snapshotID, ownerIdentifier: context.clientIdentifier)
+        let captured = record.envelope.captured
         let driver = self.driver
         if kind == "element" {
             let elementID = try targetReader.requiredString("element_id")
@@ -173,6 +183,9 @@ public actor ComputerUseRuntime: ToolCalling {
                 throw ComputerUseError.invalidArguments("element_id is outside the v2 contract.")
             }
             let element = try element(identifier: elementID, in: captured)
+            guard !AppAccessPolicy.isSystemSettingsLaunchControl(element) else {
+                throw ComputerUseError.permissionDenied("Controls that open System Settings are not available to computer use.")
+            }
             if button == .left, count == 1,
                let primary = element.actions.first(where: { $0.caseInsensitiveCompare("AXPress") == .orderedSame })
             {
@@ -215,6 +228,145 @@ public actor ComputerUseRuntime: ToolCalling {
             }
         }
         throw ComputerUseError.invalidArguments("target.kind must be element or pixel.")
+    }
+
+    /// The input snapshot supplies only intent; planning always captures fresh
+    /// desktop state and returns a new snapshot for the later click.
+    private func planClick(arguments: [String: JSONValue], context: ToolCallContext) async throws -> ToolExecutionResult {
+        var reader = ArgumentReader(arguments)
+        let snapshotID = try reader.requiredString("snapshot_id")
+        var targetReader = ArgumentReader(try reader.requiredObject("target"))
+        let kind = try targetReader.requiredString("kind")
+        let buttonName = try reader.optionalString("button") ?? MouseButton.left.rawValue
+        let count = try reader.optionalInteger("count", default: 1)
+        try reader.finish()
+
+        guard let button = MouseButton(rawValue: buttonName), button != .middle, (1...2).contains(count) else {
+            throw ComputerUseError.invalidArguments("button or count is invalid.")
+        }
+        let sourceRecord = try planningSourceSnapshot(identifier: snapshotID, ownerIdentifier: context.clientIdentifier)
+        let source = sourceRecord.envelope.captured
+
+        if kind == "element" {
+            let elementID = try targetReader.requiredString("element_id")
+            try targetReader.finish()
+            guard (1...128).contains(elementID.utf8.count) else {
+                throw ComputerUseError.invalidArguments("element_id is outside the v2 contract.")
+            }
+            let sourceElement = try element(identifier: elementID, in: source)
+            guard !AppAccessPolicy.isSystemSettingsLaunchControl(sourceElement) else {
+                throw ComputerUseError.permissionDenied("Controls that open System Settings are not available to computer use.")
+            }
+            let record = try await freshPlanningSnapshot(for: sourceRecord, context: context)
+            let captured = record.envelope.captured
+            let element = try resolvePlannedElement(source: sourceElement, in: captured)
+            let label = inlineTargetText(element.label ?? element.value ?? "")
+            let mechanism: String
+            if button == .left, count == 1,
+               let primary = element.actions.first(where: { $0.caseInsensitiveCompare("AXPress") == .orderedSame })
+            {
+                mechanism = "accessibility_action=\(primary)"
+            } else if let frame = element.frame,
+                      let rect = CoordinateMapper.pngRect(for: frame, in: captured.geometry)
+            {
+                mechanism = "pixel_center_px=(\(targetCoordinate(rect.x + rect.width / 2)),\(targetCoordinate(rect.y + rect.height / 2)))"
+            } else {
+                throw ComputerUseError.invalidArguments("The selected element has no actionable frame.")
+            }
+            let point: PNGPixelPoint
+            if let frame = element.frame,
+               let rect = CoordinateMapper.pngRect(for: frame, in: captured.geometry)
+            {
+                point = PNGPixelPoint(x: rect.x + rect.width / 2, y: rect.y + rect.height / 2)
+            } else {
+                throw ComputerUseError.invalidArguments("The selected element has no visible screenshot frame.")
+            }
+            let result = try plannedClickResult(
+                text: "planned_click snapshot_id=\(record.envelope.snapshotIdentifier) target=element id=\(element.identifier) role=\(inlineTargetText(element.role)) label=\"\(label)\" button=\(button.rawValue) count=\(count) \(mechanism)\nThe attached image marks the resolved click point. No input was sent; call click with this snapshot_id and target to dispatch.",
+                point: point,
+                record: record
+            )
+            return try registerPlannedPreview(result, for: record.envelope.snapshotIdentifier)
+        }
+
+        if kind == "pixel" {
+            let pixel = PNGPixelPoint(
+                x: try targetReader.requiredNumber("x_px"),
+                y: try targetReader.requiredNumber("y_px")
+            )
+            try targetReader.finish()
+            let global = try CoordinateMapper.globalPoint(for: pixel, in: source.geometry)
+            let record = try await freshPlanningSnapshot(for: sourceRecord, context: context)
+            let freshPixel = try pngPoint(for: global, in: record.envelope.captured.geometry)
+            let result = try plannedClickResult(
+                text: "planned_click snapshot_id=\(record.envelope.snapshotIdentifier) target=pixel point_px=(\(targetCoordinate(freshPixel.x)),\(targetCoordinate(freshPixel.y))) button=\(button.rawValue) count=\(count)\nThe attached image marks the resolved click point. No input was sent; call click with this snapshot_id and target to dispatch.",
+                point: freshPixel,
+                record: record
+            )
+            return try registerPlannedPreview(result, for: record.envelope.snapshotIdentifier)
+        }
+
+        throw ComputerUseError.invalidArguments("target.kind must be element or pixel.")
+    }
+
+    private func planningSourceSnapshot(identifier: String, ownerIdentifier: String) throws -> SnapshotRecord {
+        guard let record = snapshots[identifier], record.ownerIdentifier == ownerIdentifier, !record.consumed else {
+            throw ComputerUseError.invalidSnapshot
+        }
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: record.envelope.captured.app.bundleIdentifier)
+        return record
+    }
+
+    private func freshPlanningSnapshot(for source: SnapshotRecord, context: ToolCallContext) async throws -> SnapshotRecord {
+        let lease = try acquireLease(for: context.clientIdentifier)
+        let captured = try await driver.capture(
+            processIdentifier: source.envelope.captured.app.processIdentifier,
+            windowIdentifier: source.envelope.captured.geometry.windowIdentifier
+        )
+        let renewed = try renewLease(ownerIdentifier: context.clientIdentifier, fence: lease.fence, requireUnexpired: true)
+        let envelope = storeSnapshot(captured, ownerIdentifier: context.clientIdentifier, lease: renewed)
+        guard let record = snapshots[envelope.snapshotIdentifier] else {
+            throw ComputerUseError.internalFailure("The fresh planning snapshot was not retained.")
+        }
+        return record
+    }
+
+    private func resolvePlannedElement(source: AccessibilityElementSnapshot, in captured: CapturedDesktopState) throws -> AccessibilityElementSnapshot {
+        let matches = captured.elements.filter {
+            $0.role == source.role && $0.label == source.label && $0.value == source.value
+        }
+        guard matches.count == 1 else {
+            throw ComputerUseError.stateUnavailable("The intended element could not be resolved uniquely in the fresh screenshot. Call get_app_state and choose a current target.")
+        }
+        return matches[0]
+    }
+
+    private func registerPlannedPreview(_ result: ToolExecutionResult, for snapshotID: String) throws -> ToolExecutionResult {
+        guard let previewHash = result.protectedCarrier?.pngSHA256,
+              var record = snapshots[snapshotID]
+        else {
+            throw ComputerUseError.internalFailure("The visual click preview did not retain its delivery binding.")
+        }
+        record.allowedDeliverySHA256.insert(previewHash)
+        snapshots[snapshotID] = record
+        return result
+    }
+
+    private func plannedClickResult(
+        text: String,
+        point: PNGPixelPoint,
+        record: SnapshotRecord
+    ) throws -> ToolExecutionResult {
+        let preview = try annotatedClickPreview(
+            screenshotPNG: record.envelope.captured.screenshotPNG,
+            geometry: record.envelope.captured.geometry,
+            point: point
+        )
+        return ToolExecutionResult(
+            text: text,
+            imagePNG: preview,
+            protectedCarrier: try ProtectedComputerUseCarrier(snapshot: record.envelope, imagePNG: preview)
+        )
     }
 
     private func performSecondaryAction(arguments: [String: JSONValue], context: ToolCallContext) async throws -> ToolExecutionResult {
@@ -365,7 +517,7 @@ public actor ComputerUseRuntime: ToolCalling {
         guard var record = snapshots[snapshotID],
               record.ownerIdentifier == context.clientIdentifier,
               record.envelope.deliveryAttestationIdentifier == attestationID,
-              record.envelope.captured.screenshotSHA256 == pngSHA256,
+              record.allowedDeliverySHA256.contains(pngSHA256),
               let current = lease,
               current.ownerIdentifier == context.clientIdentifier,
               current.fence == record.fence,
@@ -624,7 +776,8 @@ public actor ComputerUseRuntime: ToolCalling {
             ownerIdentifier: ownerIdentifier,
             fence: lease.fence,
             consumed: false,
-            deliveryAttested: false
+            deliveryAttested: false,
+            allowedDeliverySHA256: [captured.screenshotSHA256]
         )
         return envelope
     }
@@ -644,6 +797,7 @@ public actor ComputerUseRuntime: ToolCalling {
         else {
             throw ComputerUseError.invalidSnapshot
         }
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: record.envelope.captured.app.bundleIdentifier)
         return record
     }
 
@@ -676,12 +830,36 @@ public actor ComputerUseRuntime: ToolCalling {
         var header = "snapshot_id=\(envelope.snapshotIdentifier)\n"
         if let receiptIdentifier { header += "receipt_id=\(receiptIdentifier) action_state=applied\n" }
         header += "Coordinates use continuous PNG edge-space: width=\(captured.geometry.pngWidthPixels), height=\(captured.geometry.pngHeightPixels), origin=(0,0) top-left, x right, y down; require 0<=x<width and 0<=y<height.\n"
+        header += targetCandidatesText(for: captured)
         let text = boundedUTF8(header + captured.accessibilityTree, maximumBytes: 16 * 1_024)
         return ToolExecutionResult(
             text: text,
             imagePNG: captured.screenshotPNG,
             protectedCarrier: try ProtectedComputerUseCarrier(snapshot: envelope)
         )
+    }
+
+    private func targetCandidatesText(for captured: CapturedDesktopState) -> String {
+        let maximumCandidates = 64
+        let maximumBytes = 4 * 1_024
+        var result = "target_candidates (match these to the screenshot; prefer element targets with AXPress):\n"
+        var count = 0
+
+        for element in captured.elements {
+            guard count < maximumCandidates,
+                  element.actions.contains(where: { $0.caseInsensitiveCompare("AXPress") == .orderedSame }),
+                  let frame = element.frame,
+                  let rect = CoordinateMapper.pngRect(for: frame, in: captured.geometry)
+            else {
+                continue
+            }
+            let label = inlineTargetText(element.label ?? element.value ?? "")
+            let line = "- id=\(element.identifier) role=\(inlineTargetText(element.role)) label=\"\(label)\" action=AXPress bbox_px=(\(targetCoordinate(rect.x)),\(targetCoordinate(rect.y)),\(targetCoordinate(rect.width)),\(targetCoordinate(rect.height)))\n"
+            guard result.utf8.count + line.utf8.count <= maximumBytes else { break }
+            result += line
+            count += 1
+        }
+        return result
     }
 
     private func recoveredOutcomeResult(_ receipt: ActionReceipt) -> ToolExecutionResult {
@@ -712,4 +890,111 @@ private func boundedUTF8(_ value: String, maximumBytes: Int) -> String {
         used += count
     }
     return result
+}
+
+private func inlineTargetText(_ value: String) -> String {
+    boundedUTF8(
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " "),
+        maximumBytes: 256
+    )
+}
+
+private func targetCoordinate(_ value: Double) -> String {
+    String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
+}
+
+private func pngPoint(for global: GlobalScreenPoint, in geometry: WindowGeometry) throws -> PNGPixelPoint {
+    let bounds = geometry.globalBoundsPoints
+    guard bounds.width > 0, bounds.height > 0 else {
+        throw ComputerUseError.invalidSnapshot
+    }
+    let point = PNGPixelPoint(
+        x: (global.x - bounds.x) * Double(geometry.pngWidthPixels) / bounds.width,
+        y: (global.y - bounds.y) * Double(geometry.pngHeightPixels) / bounds.height
+    )
+    guard point.x.isFinite, point.y.isFinite,
+          point.x >= 0, point.y >= 0,
+          point.x < Double(geometry.pngWidthPixels), point.y < Double(geometry.pngHeightPixels)
+    else {
+        throw ComputerUseError.stateUnavailable("The requested point is outside the fresh screenshot.")
+    }
+    return point
+}
+
+/// Produces a visual-only derivative of the protected snapshot for model
+/// grounding. It never changes the captured image, the desktop, or the action
+/// authorization; the marker is a deterministic description of the resolved
+/// PNG pixel-edge point.
+private func annotatedClickPreview(
+    screenshotPNG: Data,
+    geometry: WindowGeometry,
+    point: PNGPixelPoint
+) throws -> Data {
+    guard point.x.isFinite,
+          point.y.isFinite,
+          point.x >= 0,
+          point.y >= 0,
+          point.x < Double(geometry.pngWidthPixels),
+          point.y < Double(geometry.pngHeightPixels),
+          let source = CGImageSourceCreateWithData(screenshotPNG as CFData, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+          image.width == geometry.pngWidthPixels,
+          image.height == geometry.pngHeightPixels,
+          let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: image.width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+          )
+    else {
+        throw ComputerUseError.stateUnavailable("Could not create a visual click preview for this snapshot.")
+    }
+
+    let width = CGFloat(image.width)
+    let height = CGFloat(image.height)
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    // This bitmap context and the canonical PNG use the same top-left pixel
+    // rows, so the resolved PNG point is also the cursor tip directly.
+    let markerX = CGFloat(point.x)
+    let markerY = CGFloat(point.y)
+    let cursorSize = min(max(28, min(width, height) * 0.075), 72)
+    let cursor = CGMutablePath()
+    // The arrow tip is the requested point. The body extends down/right, like
+    // a normal pointer, so the model can reason about the intended target.
+    cursor.move(to: CGPoint(x: markerX, y: markerY))
+    cursor.addLine(to: CGPoint(x: markerX, y: markerY - cursorSize))
+    cursor.addLine(to: CGPoint(x: markerX + cursorSize * 0.28, y: markerY - cursorSize * 0.72))
+    cursor.addLine(to: CGPoint(x: markerX + cursorSize * 0.52, y: markerY - cursorSize * 1.08))
+    cursor.addLine(to: CGPoint(x: markerX + cursorSize * 0.72, y: markerY - cursorSize * 0.94))
+    cursor.addLine(to: CGPoint(x: markerX + cursorSize * 0.47, y: markerY - cursorSize * 0.57))
+    cursor.addLine(to: CGPoint(x: markerX + cursorSize * 0.82, y: markerY - cursorSize * 0.5))
+    cursor.closeSubpath()
+    context.setShouldAntialias(false)
+    context.addPath(cursor)
+    context.setLineWidth(max(2, cursorSize * 0.075))
+    context.setStrokeColor(CGColor(gray: 0, alpha: 1))
+    context.setFillColor(CGColor(gray: 0, alpha: 1))
+    context.drawPath(using: .fillStroke)
+
+    guard let annotatedImage = context.makeImage() else {
+        throw ComputerUseError.stateUnavailable("Could not render a visual click preview for this snapshot.")
+    }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else {
+        throw ComputerUseError.stateUnavailable("Could not encode a visual click preview for this snapshot.")
+    }
+    CGImageDestinationAddImage(destination, annotatedImage, nil)
+    guard CGImageDestinationFinalize(destination), data.length <= 900_000 else {
+        throw ComputerUseError.stateUnavailable("The visual click preview exceeds the image safety limit.")
+    }
+    return data as Data
 }

@@ -38,4 +38,47 @@ public enum CoordinateMapper {
             y: bounds.y + pixel.y * bounds.height / Double(geometry.pngHeightPixels)
         )
     }
+
+    /// Projects a global accessibility frame into the screenshot that produced
+    /// `geometry`. The intersection is deliberate: accessibility elements may
+    /// extend beyond the captured window, while the returned rectangle must
+    /// describe only visible screenshot pixels.
+    public static func pngRect(
+        for globalRect: GlobalScreenRect,
+        in geometry: WindowGeometry
+    ) -> PNGPixelRect? {
+        let bounds = geometry.globalBoundsPoints
+        guard geometry.pngWidthPixels > 0,
+              geometry.pngHeightPixels > 0,
+              bounds.x.isFinite,
+              bounds.y.isFinite,
+              bounds.width.isFinite,
+              bounds.height.isFinite,
+              bounds.width > 0,
+              bounds.height > 0,
+              globalRect.x.isFinite,
+              globalRect.y.isFinite,
+              globalRect.width.isFinite,
+              globalRect.height.isFinite,
+              globalRect.width > 0,
+              globalRect.height > 0
+        else {
+            return nil
+        }
+
+        let left = max(globalRect.x, bounds.x)
+        let top = max(globalRect.y, bounds.y)
+        let right = min(globalRect.x + globalRect.width, bounds.x + bounds.width)
+        let bottom = min(globalRect.y + globalRect.height, bounds.y + bounds.height)
+        guard right > left, bottom > top else { return nil }
+
+        let scaleX = Double(geometry.pngWidthPixels) / bounds.width
+        let scaleY = Double(geometry.pngHeightPixels) / bounds.height
+        return PNGPixelRect(
+            x: (left - bounds.x) * scaleX,
+            y: (top - bounds.y) * scaleY,
+            width: (right - left) * scaleX,
+            height: (bottom - top) * scaleY
+        )
+    }
 }

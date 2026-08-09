@@ -54,7 +54,7 @@ public enum ToolCatalog {
         ),
         ToolDefinition(
             name: "get_app_state",
-            description: "Acquire the serialized desktop lease and return a fresh, server-authoritative screenshot plus accessibility snapshot. Call this before every action sequence, as the only computer-use tool call in this model turn.",
+            description: "Acquire the serialized desktop lease and return a fresh, server-authoritative screenshot, accessibility snapshot, and bounded target_candidates map. Call this before every action sequence, as the only computer-use tool call in this model turn. Match the user's visual intent against the current screenshot and target_candidates; never reuse a target or coordinate from an earlier snapshot. System Settings is unavailable to computer use.",
             inputSchema: objectSchema(
                 properties: [
                     "bundle_id": boundedStringSchema(minimum: 3, maximum: 255),
@@ -65,8 +65,24 @@ public enum ToolCatalog {
             annotations: readOnlyAnnotations
         ),
         ToolDefinition(
+            name: "plan_click",
+            description: "Resolve and describe the exact click that would be sent for this fresh, attested snapshot without dispatching input or consuming the snapshot. Use this when a target is uncertain, then call click with the same snapshot_id and target only if the plan matches the intended control.",
+            inputSchema: objectSchema(
+                properties: [
+                    "snapshot_id": snapshotIDSchema,
+                    "target": .object([
+                        "oneOf": .array([elementTargetSchema, pixelTargetSchema]),
+                    ]),
+                    "button": enumSchema(["left", "right"]),
+                    "count": integerEnumSchema([1, 2]),
+                ],
+                required: ["snapshot_id", "target"]
+            ),
+            annotations: readOnlyAnnotations
+        ),
+        ToolDefinition(
             name: "click",
-            description: "Consume a snapshot and click either an accessibility element or a point in that snapshot's PNG pixel-edge coordinate space. Issue exactly one computer-use tool call in this model turn.",
+            description: "Consume a snapshot and click either an accessibility element or a point in that snapshot's PNG pixel-edge coordinate space. Prefer target.kind=element when a target_candidate matches the intended control and offers AXPress (for example, intent 'open Settings' + candidate label 'Settings' -> click that element). Use target.kind=pixel only when no matching actionable element exists, and only with coordinates from this exact screenshot. Never use a control intended to open System Settings. If the expected effect is absent, acquire fresh state and re-identify the target; do not replay an uncertain action. Issue exactly one computer-use tool call in this model turn.",
             inputSchema: objectSchema(
                 properties: [
                     "snapshot_id": snapshotIDSchema,

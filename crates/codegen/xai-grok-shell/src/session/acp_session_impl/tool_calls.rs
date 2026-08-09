@@ -250,7 +250,10 @@ fn trusted_computer_use_result_requires_invalidation(
         return true;
     };
     match xai_grok_mcp::computer_use::classify_tool(&tool_name) {
-        Some(xai_grok_mcp::computer_use::ComputerUseToolClass::Effectful) => !has_protected_handoff,
+        Some(
+            xai_grok_mcp::computer_use::ComputerUseToolClass::Planning
+            | xai_grok_mcp::computer_use::ComputerUseToolClass::Effectful,
+        ) => !has_protected_handoff,
         Some(xai_grok_mcp::computer_use::ComputerUseToolClass::Observation) => {
             tool_name != "list_apps" && !has_protected_handoff
         }

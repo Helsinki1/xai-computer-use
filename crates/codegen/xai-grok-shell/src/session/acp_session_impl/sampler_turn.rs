@@ -114,7 +114,8 @@ fn protected_tool_calls_lease(
         xai_grok_mcp::computer_use::ComputerUseToolClass::Observation => {
             Ok(ProtectedResponseLease::Release)
         }
-        xai_grok_mcp::computer_use::ComputerUseToolClass::Effectful => {
+        xai_grok_mcp::computer_use::ComputerUseToolClass::Planning
+        | xai_grok_mcp::computer_use::ComputerUseToolClass::Effectful => {
             let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .ok()
                 .and_then(|value| value.as_object().cloned())
@@ -211,6 +212,14 @@ mod protected_tool_calls_lease_tests {
         assert!(matches!(
             protected_tool_calls_lease(&state, &observation, "snapshot-0000001"),
             Ok(ProtectedResponseLease::Release)
+        ));
+        let planning = [call(
+            "xai_computer_use__plan_click",
+            r#"{"snapshot_id":"snapshot-0000001","target":{"kind":"pixel","x_px":1,"y_px":2}}"#,
+        )];
+        assert!(matches!(
+            protected_tool_calls_lease(&state, &planning, "snapshot-0000001"),
+            Ok(ProtectedResponseLease::RetainForAction)
         ));
     }
 
