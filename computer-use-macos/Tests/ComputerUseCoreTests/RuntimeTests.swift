@@ -4,6 +4,23 @@ import XCTest
 
 @MainActor
 final class RuntimeTests: XCTestCase {
+    func testSnapshotIncludesBoundedVisualTargetCandidatesWithoutDriverTokens() async throws {
+        let receipts = MemoryReceiptStore()
+        let driver = FakeDesktopDriver(receipts: receipts)
+        let runtime = try makeRuntime(driver: driver, receipts: receipts)
+
+        let state = await runtime.callTool(
+            name: "get_app_state",
+            arguments: ["bundle_id": .string("com.example.fixture")],
+            context: ToolCallContext(clientIdentifier: "client-a")
+        )
+
+        XCTAssertFalse(state.isError)
+        XCTAssertTrue(state.text.contains("target_candidates"))
+        XCTAssertTrue(state.text.contains("id=e1 role=AXButton label=\"Go\" action=AXPress bbox_px=(40.00,40.00,80.00,40.00)"))
+        XCTAssertFalse(state.text.contains("driver-e1"))
+    }
+
     func testSnapshotRequiresDeliveryAttestation() async throws {
         let receipts = MemoryReceiptStore()
         let driver = FakeDesktopDriver(receipts: receipts)

@@ -34,7 +34,11 @@ final class MacOSDesktopDriver: DesktopDriving {
             windowIdentifiersByPID[owner.processID, default: []].append(window.windowID)
         }
         return NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy != .prohibited && !$0.isTerminated }
+            .filter {
+                $0.activationPolicy != .prohibited
+                    && !$0.isTerminated
+                    && !AppAccessPolicy.isBlocked(bundleIdentifier: $0.bundleIdentifier)
+            }
             .map {
                 AppDescriptor(
                     name: $0.localizedName ?? $0.bundleIdentifier ?? "Unknown",
@@ -51,6 +55,7 @@ final class MacOSDesktopDriver: DesktopDriving {
     }
 
     func capture(bundleIdentifier: String, windowIdentifier: UInt32?) async throws -> CapturedDesktopState {
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: bundleIdentifier)
         let generation = try beginCapture()
         let content = try await shareableContent()
         let candidates = NSWorkspace.shared.runningApplications.filter { app in
@@ -91,6 +96,7 @@ final class MacOSDesktopDriver: DesktopDriving {
         guard let app = NSRunningApplication(processIdentifier: processIdentifier), !app.isTerminated else {
             throw ComputerUseError.stateUnavailable("The snapshot application is no longer running.")
         }
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: app.bundleIdentifier)
         let content = try await shareableContent()
         return try await capture(
             application: app,

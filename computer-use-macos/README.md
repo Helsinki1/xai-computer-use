@@ -22,6 +22,42 @@ identity to preserve macOS privacy permissions across local rebuilds. Without
 one, the scripts fall back to ad-hoc signing and permissions must be granted
 again after every rebuild.
 
+### Local signing troubleshooting
+
+Before using a stable signing identity, make sure macOS can use it:
+
+```sh
+security find-identity -v -p codesigning
+```
+
+The output must include an `Apple Development: ... (TEAMID)` identity. A
+certificate merely visible in Keychain Access is not sufficient: it must have
+its matching private key in the active login keychain. If the identity was
+created on another Mac, export the certificate *with its private key* as a
+password-protected `.p12` on that Mac and import it into this Mac's login
+keychain. Never share the `.p12` file or its password.
+
+If signing fails with both `unable to build chain to self-signed root` and
+`errSecInternalComponent`, install Apple's WWDR G3 intermediate certificate,
+which is the issuer for Apple Development software-signing certificates:
+
+```sh
+curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+open AppleWWDRCAG3.cer
+```
+
+Import the downloaded certificate into Keychain Access, then verify the
+identity again and rebuild with its exact displayed name:
+
+```sh
+security find-identity -v -p codesigning
+export GROK_COMPUTER_USE_CODESIGN_IDENTITY='Apple Development: Your Name (TEAMID)'
+computer-use-macos/scripts/run-local.sh --rebuild
+```
+
+Keep the login keychain unlocked while building; `codesign` needs access to
+the identity's private key.
+
 ```sh
 computer-use-macos/scripts/run-local.sh computer-use enable
 computer-use-macos/scripts/run-local.sh

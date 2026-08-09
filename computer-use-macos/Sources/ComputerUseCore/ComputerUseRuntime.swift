@@ -106,7 +106,9 @@ public actor ComputerUseRuntime: ToolCalling {
     private func listApps(arguments: [String: JSONValue]) async throws -> ToolExecutionResult {
         var reader = ArgumentReader(arguments)
         try reader.finish()
-        let apps = try await driver.listApps()
+        let apps = try await driver.listApps().filter {
+            !AppAccessPolicy.isBlocked(bundleIdentifier: $0.bundleIdentifier)
+        }
         var text = "running_apps=\(apps.count)\n"
         for app in apps {
             let windowIDs = app.windowIdentifiers.map(String.init).joined(separator: ",")
@@ -127,6 +129,7 @@ public actor ComputerUseRuntime: ToolCalling {
         else {
             throw ComputerUseError.invalidArguments("bundle_id or window_id is outside the v2 contract.")
         }
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: bundleIdentifier)
 
         let activeLease = try acquireLease(for: clientIdentifier)
         do {
@@ -173,6 +176,9 @@ public actor ComputerUseRuntime: ToolCalling {
                 throw ComputerUseError.invalidArguments("element_id is outside the v2 contract.")
             }
             let element = try element(identifier: elementID, in: captured)
+            guard !AppAccessPolicy.isSystemSettingsLaunchControl(element) else {
+                throw ComputerUseError.permissionDenied("Controls that open System Settings are not available to computer use.")
+            }
             if button == .left, count == 1,
                let primary = element.actions.first(where: { $0.caseInsensitiveCompare("AXPress") == .orderedSame })
             {
@@ -644,6 +650,7 @@ public actor ComputerUseRuntime: ToolCalling {
         else {
             throw ComputerUseError.invalidSnapshot
         }
+        try AppAccessPolicy.requireAllowed(bundleIdentifier: record.envelope.captured.app.bundleIdentifier)
         return record
     }
 
@@ -676,12 +683,36 @@ public actor ComputerUseRuntime: ToolCalling {
         var header = "snapshot_id=\(envelope.snapshotIdentifier)\n"
         if let receiptIdentifier { header += "receipt_id=\(receiptIdentifier) action_state=applied\n" }
         header += "Coordinates use continuous PNG edge-space: width=\(captured.geometry.pngWidthPixels), height=\(captured.geometry.pngHeightPixels), origin=(0,0) top-left, x right, y down; require 0<=x<width and 0<=y<height.\n"
+        header += targetCandidatesText(for: captured)
         let text = boundedUTF8(header + captured.accessibilityTree, maximumBytes: 16 * 1_024)
         return ToolExecutionResult(
             text: text,
             imagePNG: captured.screenshotPNG,
             protectedCarrier: try ProtectedComputerUseCarrier(snapshot: envelope)
         )
+    }
+
+    private func targetCandidatesText(for captured: CapturedDesktopState) -> String {
+        let maximumCandidates = 64
+        let maximumBytes = 4 * 1_024
+        var result = "target_candidates (match these to the screenshot; prefer element targets with AXPress):\n"
+        var count = 0
+
+        for element in captured.elements {
+            guard count < maximumCandidates,
+                  element.actions.contains(where: { $0.caseInsensitiveCompare("AXPress") == .orderedSame }),
+                  let frame = element.frame,
+                  let rect = CoordinateMapper.pngRect(for: frame, in: captured.geometry)
+            else {
+                continue
+            }
+            let label = inlineTargetText(element.label ?? element.value ?? "")
+            let line = "- id=\(element.identifier) role=\(inlineTargetText(element.role)) label=\"\(label)\" action=AXPress bbox_px=(\(targetCoordinate(rect.x)),\(targetCoordinate(rect.y)),\(targetCoordinate(rect.width)),\(targetCoordinate(rect.height)))\n"
+            guard result.utf8.count + line.utf8.count <= maximumBytes else { break }
+            result += line
+            count += 1
+        }
+        return result
     }
 
     private func recoveredOutcomeResult(_ receipt: ActionReceipt) -> ToolExecutionResult {
@@ -712,4 +743,19 @@ private func boundedUTF8(_ value: String, maximumBytes: Int) -> String {
         used += count
     }
     return result
+}
+
+private func inlineTargetText(_ value: String) -> String {
+    boundedUTF8(
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " "),
+        maximumBytes: 256
+    )
+}
+
+private func targetCoordinate(_ value: Double) -> String {
+    String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
 }

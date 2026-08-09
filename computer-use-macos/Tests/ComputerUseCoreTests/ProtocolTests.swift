@@ -13,6 +13,35 @@ final class ProtocolTests: XCTestCase {
         }
     }
 
+    func testClickGuidancePrefersCurrentSemanticTargetsAndSafeRecovery() throws {
+        let getState = try XCTUnwrap(ToolCatalog.all.first(where: { $0.name == "get_app_state" }))
+        let click = try XCTUnwrap(ToolCatalog.all.first(where: { $0.name == "click" }))
+
+        XCTAssertTrue(getState.description.contains("target_candidates"))
+        XCTAssertTrue(click.description.contains("Prefer target.kind=element"))
+        XCTAssertTrue(click.description.contains("do not replay an uncertain action"))
+        XCTAssertTrue(click.description.contains("System Settings"))
+    }
+
+    func testSystemSettingsIsBlockedByBundleAndExplicitLaunchControl() throws {
+        XCTAssertTrue(AppAccessPolicy.isBlocked(bundleIdentifier: "com.apple.systempreferences"))
+        XCTAssertTrue(AppAccessPolicy.isBlocked(bundleIdentifier: "COM.APPLE.SYSTEMPREFERENCES"))
+        XCTAssertFalse(AppAccessPolicy.isBlocked(bundleIdentifier: "com.example.fixture"))
+        XCTAssertThrowsError(try AppAccessPolicy.requireAllowed(bundleIdentifier: "com.apple.systempreferences"))
+
+        let launchControl = AccessibilityElementSnapshot(
+            identifier: "e1",
+            role: "AXButton",
+            label: "Open System Settings",
+            value: nil,
+            frame: nil,
+            actions: ["AXPress"],
+            isValueSettable: false,
+            driverToken: "private"
+        )
+        XCTAssertTrue(AppAccessPolicy.isSystemSettingsLaunchControl(launchControl))
+    }
+
     func testAuthenticatedAgentEnvelopeDetectsMutation() throws {
         let key = Data(repeating: 7, count: 32)
         let base = AgentRequest(

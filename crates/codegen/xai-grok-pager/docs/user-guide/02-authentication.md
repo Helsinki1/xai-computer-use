@@ -52,6 +52,37 @@ grok
 
 Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.grok/auth.json`.
 
+### Switching from browser login to an API key
+
+If Grok reports the tier or limits of a browser-signed-in account even though
+`XAI_API_KEY` is set, its cached OAuth session is still active. Log out of the
+browser session, then start Grok from a shell that has the key exported:
+
+```bash
+grok logout
+export XAI_API_KEY="xai-..."
+grok
+```
+
+For a source checkout, use the equivalent commands:
+
+```bash
+cargo run -p xai-grok-pager-bin -- logout
+export XAI_API_KEY="xai-..."
+computer-use-macos/scripts/run-local.sh
+```
+
+In the TUI, run `/status` and confirm it reports API-key authentication:
+
+```text
+Auth method: API key (XAI_API_KEY)
+```
+
+API-key sessions use xAI Console API billing and do not inherit the Grok.com
+consumer subscription tier. If `/status` still says `OAuth`, make sure
+`XAI_API_KEY` is exported in the same terminal that launches Grok, then run
+`grok logout` again.
+
 ---
 
 ## OIDC (Customer SSO)
