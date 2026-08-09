@@ -11,13 +11,16 @@ import modal
 
 APP_NAME = "linux-computer-use-mvp"
 LOCAL_SUBTREE = Path(__file__).resolve().parent
-REMOTE_SUBTREE = "/root/computer-use-linux"
+LOCAL_REPO_ROOT = LOCAL_SUBTREE.parent
+REMOTE_REPO_ROOT = "/root/xai-computer-use"
+REMOTE_SUBTREE = f"{REMOTE_REPO_ROOT}/computer-use-linux"
 SUPPORT_DIR = "/root/.local/share/grok-computer-use"
 RUNTIME_DIR = "/root/modal-runtime"
 LOG_DIR = "/root/modal-logs"
 
 
 desktop_logs = modal.Volume.from_name(f"{APP_NAME}-logs", create_if_missing=True)
+xai_secret = modal.Secret.from_name("xai-api-key", required_keys=["XAI_API_KEY"])
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -45,12 +48,13 @@ image = (
             "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         }
     )
-    .add_local_dir(str(LOCAL_SUBTREE), REMOTE_SUBTREE, copy=True)
+    .add_local_dir(str(LOCAL_REPO_ROOT), REMOTE_REPO_ROOT, copy=True)
     .run_commands(
         "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.94.0",
+        f"bash -lc 'source /root/.cargo/env && cd {REMOTE_REPO_ROOT} && cargo build --release -p xai-grok-pager-bin'",
         f"bash -lc 'source /root/.cargo/env && cd {REMOTE_SUBTREE} && cargo build --release'",
         f"bash -lc 'cd {REMOTE_SUBTREE} && ./scripts/install.sh'",
-        f"chmod +x {REMOTE_SUBTREE}/scripts/start_modal_x11_demo.sh {REMOTE_SUBTREE}/scripts/mcp_smoke_test.py {REMOTE_SUBTREE}/scripts/modal_restaurant_demo.py",
+        f"chmod +x {REMOTE_SUBTREE}/scripts/start_modal_x11_demo.sh {REMOTE_SUBTREE}/scripts/start_modal_grok.sh {REMOTE_SUBTREE}/scripts/mcp_smoke_test.py {REMOTE_SUBTREE}/scripts/modal_restaurant_demo.py",
     )
 )
 
@@ -88,6 +92,7 @@ def wait_for_port(port: int, *, timeout_seconds: float, process: subprocess.Pope
     min_containers=1,
     scaledown_window=60 * 30,
     volumes={LOG_DIR: desktop_logs},
+    secrets=[xai_secret],
 )
 class Desktop:
     @modal.enter()
@@ -114,6 +119,7 @@ class Desktop:
     image=image,
     timeout=60 * 10,
     volumes={LOG_DIR: desktop_logs},
+    secrets=[xai_secret],
 )
 def smoke_test() -> str:
     env = {

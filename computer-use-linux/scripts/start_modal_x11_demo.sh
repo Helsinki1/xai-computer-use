@@ -55,6 +55,12 @@ xterm \
   -geometry 120x30+40+40 \
   -title "linux-computer-use-mvp" \
   -e bash -lc 'printf "linux-computer-use-mvp\n\nThis X11 desktop is running inside Modal.\nThe daemon logs are in /tmp/grok-computer-use-logs.\n\n"; exec bash' &
+xterm \
+  -fa Monospace \
+  -fs 12 \
+  -geometry 120x30+220+80 \
+  -title "grok-build" \
+  -e bash -lc '${HOME}/computer-use-linux/scripts/start_modal_grok.sh' &
 EOF
 
 Xvfb "${DISPLAY}" -screen 0 "${SCREEN_GEOMETRY}" -ac +extension RANDR >"${LOG_ROOT}/xvfb.log" 2>&1 &
@@ -110,7 +116,9 @@ done
     exit 1
 }
 
-python3 "${HOME}/computer-use-linux/scripts/modal_restaurant_demo.py" >"${LOG_ROOT}/demo.log" 2>&1 &
+if [[ "${RUN_SCRIPTED_DEMO:-0}" == "1" ]]; then
+  python3 "${HOME}/computer-use-linux/scripts/modal_restaurant_demo.py" >"${LOG_ROOT}/demo.log" 2>&1 &
+fi
 
 x11vnc \
   -display "${DISPLAY}" \
