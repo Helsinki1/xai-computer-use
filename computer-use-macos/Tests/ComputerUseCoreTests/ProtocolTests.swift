@@ -3,11 +3,11 @@ import XCTest
 @testable import ComputerUseCore
 
 final class ProtocolTests: XCTestCase {
-    func testCatalogHasExactNineCanonicalSchemas() throws {
+    func testCatalogHasExactTenCanonicalSchemas() throws {
         let expectedData = Data(canonicalSchemas.utf8)
         let expected = try JSONDecoder().decode([String: JSONValue].self, from: expectedData)
         XCTAssertEqual(Set(ToolCatalog.all.map(\.name)), Set(expected.keys))
-        XCTAssertEqual(ToolCatalog.all.count, 9)
+        XCTAssertEqual(ToolCatalog.all.count, 10)
         for tool in ToolCatalog.all {
             XCTAssertEqual(tool.inputSchema, expected[tool.name], "schema drift for \(tool.name)")
         }
@@ -15,12 +15,14 @@ final class ProtocolTests: XCTestCase {
 
     func testClickGuidancePrefersCurrentSemanticTargetsAndSafeRecovery() throws {
         let getState = try XCTUnwrap(ToolCatalog.all.first(where: { $0.name == "get_app_state" }))
+        let planClick = try XCTUnwrap(ToolCatalog.all.first(where: { $0.name == "plan_click" }))
         let click = try XCTUnwrap(ToolCatalog.all.first(where: { $0.name == "click" }))
 
         XCTAssertTrue(getState.description.contains("target_candidates"))
         XCTAssertTrue(click.description.contains("Prefer target.kind=element"))
         XCTAssertTrue(click.description.contains("do not replay an uncertain action"))
         XCTAssertTrue(click.description.contains("System Settings"))
+        XCTAssertTrue(planClick.description.contains("without dispatching input"))
     }
 
     func testSystemSettingsIsBlockedByBundleAndExplicitLaunchControl() throws {
@@ -206,6 +208,7 @@ private let canonicalSchemas = #"""
 {
   "list_apps":{"type":"object","properties":{},"additionalProperties":false},
   "get_app_state":{"type":"object","properties":{"bundle_id":{"type":"string","minLength":3,"maxLength":255},"window_id":{"type":"integer","minimum":1,"maximum":4294967295}},"additionalProperties":false,"required":["bundle_id"]},
+  "plan_click":{"type":"object","properties":{"snapshot_id":{"type":"string","minLength":16,"maxLength":128},"target":{"oneOf":[{"type":"object","properties":{"kind":{"const":"element"},"element_id":{"type":"string","minLength":1,"maxLength":128}},"additionalProperties":false,"required":["kind","element_id"]},{"type":"object","properties":{"kind":{"const":"pixel"},"x_px":{"type":"number"},"y_px":{"type":"number"}},"additionalProperties":false,"required":["kind","x_px","y_px"]}]},"button":{"type":"string","enum":["left","right"]},"count":{"type":"integer","enum":[1,2]}},"additionalProperties":false,"required":["snapshot_id","target"]},
   "click":{"type":"object","properties":{"snapshot_id":{"type":"string","minLength":16,"maxLength":128},"target":{"oneOf":[{"type":"object","properties":{"kind":{"const":"element"},"element_id":{"type":"string","minLength":1,"maxLength":128}},"additionalProperties":false,"required":["kind","element_id"]},{"type":"object","properties":{"kind":{"const":"pixel"},"x_px":{"type":"number"},"y_px":{"type":"number"}},"additionalProperties":false,"required":["kind","x_px","y_px"]}]},"button":{"type":"string","enum":["left","right"]},"count":{"type":"integer","enum":[1,2]}},"additionalProperties":false,"required":["snapshot_id","target"]},
   "drag":{"type":"object","properties":{"snapshot_id":{"type":"string","minLength":16,"maxLength":128},"from":{"type":"object","properties":{"x_px":{"type":"number"},"y_px":{"type":"number"}},"additionalProperties":false,"required":["x_px","y_px"]},"to":{"type":"object","properties":{"x_px":{"type":"number"},"y_px":{"type":"number"}},"additionalProperties":false,"required":["x_px","y_px"]}},"additionalProperties":false,"required":["snapshot_id","from","to"]},
   "perform_secondary_action":{"type":"object","properties":{"snapshot_id":{"type":"string","minLength":16,"maxLength":128},"element_id":{"type":"string","minLength":1,"maxLength":128},"action_id":{"type":"string","minLength":1,"maxLength":128}},"additionalProperties":false,"required":["snapshot_id","element_id","action_id"]},

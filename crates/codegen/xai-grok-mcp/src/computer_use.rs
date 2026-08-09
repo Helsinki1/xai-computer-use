@@ -180,7 +180,7 @@ pub enum ComputerUseToolClass {
 
 pub fn classify_tool(name: &str) -> Option<ComputerUseToolClass> {
     match name {
-        "list_apps" | "get_app_state" => Some(ComputerUseToolClass::Observation),
+        "list_apps" | "get_app_state" | "plan_click" => Some(ComputerUseToolClass::Observation),
         "click"
         | "drag"
         | "perform_secondary_action"
@@ -207,7 +207,7 @@ pub(crate) fn should_capture_observation(
     if result.is_error != Some(false) {
         return false;
     }
-    tool_name == "get_app_state"
+    (tool_name == "get_app_state" || tool_name == "plan_click")
         || (class == ComputerUseToolClass::Effectful
             && result
                 .meta
@@ -296,7 +296,7 @@ fn pixel_point_schema() -> Value {
     )
 }
 
-/// Canonical, exact input schemas for the nine public tools.
+/// Canonical, exact input schemas for the ten public tools.
 pub fn computer_use_v2_tool_schemas() -> BTreeMap<&'static str, Value> {
     let element_target = strict_object(
         json!({
@@ -313,6 +313,7 @@ pub fn computer_use_v2_tool_schemas() -> BTreeMap<&'static str, Value> {
         }),
         &["kind", "x_px", "y_px"],
     );
+    let click_target = json!({"oneOf":[element_target, pixel_target]});
 
     BTreeMap::from([
         ("list_apps", strict_object(json!({}), &[])),
@@ -324,11 +325,23 @@ pub fn computer_use_v2_tool_schemas() -> BTreeMap<&'static str, Value> {
             ),
         ),
         (
+            "plan_click",
+            strict_object(
+                json!({
+                    "snapshot_id":snapshot_id_schema(),
+                    "target":click_target.clone(),
+                    "button":{"type":"string", "enum":["left", "right"]},
+                    "count":{"type":"integer", "enum":[1, 2]},
+                }),
+                &["snapshot_id", "target"],
+            ),
+        ),
+        (
             "click",
             strict_object(
                 json!({
                     "snapshot_id":snapshot_id_schema(),
-                    "target":{"oneOf":[element_target, pixel_target]},
+                    "target":click_target,
                     "button":{"type":"string", "enum":["left", "right"]},
                     "count":{"type":"integer", "enum":[1, 2]},
                 }),
@@ -1215,6 +1228,11 @@ mod tests {
             "get_app_state",
             ComputerUseToolClass::Observation,
             &plain_success,
+        ));
+        assert!(should_capture_observation(
+            "plan_click",
+            ComputerUseToolClass::Observation,
+            &protected_success,
         ));
         assert!(should_capture_observation(
             "click",

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum JSONValue: Sendable, Equatable, Codable {
@@ -321,16 +322,17 @@ public struct ProtectedComputerUseCarrier: Codable, Sendable, Equatable {
     public let captureWidthPoints: Double
     public let captureHeightPoints: Double
 
-    public init(snapshot: SnapshotEnvelope) throws {
+    public init(snapshot: SnapshotEnvelope, imagePNG: Data? = nil) throws {
         let captured = snapshot.captured
+        let protectedPNG = imagePNG ?? captured.screenshotPNG
         guard let bundleID = captured.app.bundleIdentifier,
               (3...255).contains(bundleID.utf8.count),
               (16...128).contains(snapshot.snapshotIdentifier.utf8.count),
               (16...128).contains(snapshot.deliveryAttestationIdentifier.utf8.count),
               captured.screenshotSHA256.count == 64,
               captured.screenshotSHA256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
-              !captured.screenshotPNG.isEmpty,
-              captured.screenshotPNG.count <= 900_000,
+              !protectedPNG.isEmpty,
+              protectedPNG.count <= 900_000,
               (1...1_280).contains(captured.geometry.pngWidthPixels),
               (1...1_280).contains(captured.geometry.pngHeightPixels),
               captured.geometry.pngWidthPixels * captured.geometry.pngHeightPixels <= 1_638_400,
@@ -349,7 +351,9 @@ public struct ProtectedComputerUseCarrier: Codable, Sendable, Equatable {
         attestationID = snapshot.deliveryAttestationIdentifier
         self.bundleID = bundleID
         windowID = captured.geometry.windowIdentifier
-        pngSHA256 = captured.screenshotSHA256
+        pngSHA256 = imagePNG == nil
+            ? captured.screenshotSHA256
+            : SHA256.hash(data: protectedPNG).map { String(format: "%02x", $0) }.joined()
         pngWidth = captured.geometry.pngWidthPixels
         pngHeight = captured.geometry.pngHeightPixels
         let bounds = captured.geometry.globalBoundsPoints

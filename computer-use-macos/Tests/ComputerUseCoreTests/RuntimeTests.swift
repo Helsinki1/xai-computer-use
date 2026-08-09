@@ -1,4 +1,8 @@
+import CoreGraphics
+import CryptoKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import ComputerUseCore
 
@@ -42,6 +46,49 @@ final class RuntimeTests: XCTestCase {
 
         let attested = await attest(carrier, runtime: runtime, client: "client-a")
         XCTAssertFalse(attested.isError)
+    }
+
+    func testPlanClickDescribesSemanticDispatchWithoutSendingInputOrConsumingSnapshot() async throws {
+        let receipts = MemoryReceiptStore()
+        let driver = FakeDesktopDriver(receipts: receipts)
+        let runtime = try makeRuntime(driver: driver, receipts: receipts)
+        let state = await runtime.callTool(
+            name: "get_app_state",
+            arguments: ["bundle_id": .string("com.example.fixture")],
+            context: ToolCallContext(clientIdentifier: "client-a")
+        )
+        let carrier = try XCTUnwrap(state.protectedCarrier)
+        _ = await attest(carrier, runtime: runtime, client: "client-a")
+
+        let plan = await runtime.callTool(
+            name: "plan_click",
+            arguments: [
+                "snapshot_id": .string(carrier.snapshotID),
+                "target": .object(["kind": .string("element"), "element_id": .string("e1")]),
+            ],
+            context: ToolCallContext(clientIdentifier: "client-a")
+        )
+
+        XCTAssertFalse(plan.isError)
+        XCTAssertTrue(plan.text.contains("accessibility_action=AXPress"))
+        XCTAssertTrue(plan.text.contains("attached image marks the resolved click point"))
+        let preview = try XCTUnwrap(plan.imagePNG)
+        XCTAssertTrue(hasOpaqueBlackPixel(atTopLeft: PNGPixelPoint(x: 80, y: 60), in: preview))
+        XCTAssertEqual(
+            try XCTUnwrap(plan.protectedCarrier).pngSHA256,
+            SHA256.hash(data: preview).map { String(format: "%02x", $0) }.joined()
+        )
+        XCTAssertEqual(driver.clickCount, 0)
+
+        let click = await runtime.callTool(
+            name: "click",
+            arguments: [
+                "snapshot_id": .string(carrier.snapshotID),
+                "target": .object(["kind": .string("element"), "element_id": .string("e1")]),
+            ],
+            context: ToolCallContext(clientIdentifier: "client-a", actionIdentifier: "planned-click")
+        )
+        XCTAssertFalse(click.isError)
     }
 
     func testOnlyFirstConcurrentActionReachesAnEffectAndReceiptIsDispatchedFirst() async throws {
@@ -351,7 +398,7 @@ private final class FakeDesktopDriver: DesktopDriving {
                 pngWidthPixels: 800,
                 pngHeightPixels: 400
             ),
-            screenshotPNG: Data([0x89, 0x50, 0x4e, 0x47]),
+            screenshotPNG: fixturePNG(width: 800, height: 400),
             screenshotSHA256: String(repeating: "0", count: 64),
             accessibilityTree: "[e1] AXButton label=\"Go\" actions=AXPress",
             elements: [
@@ -368,6 +415,56 @@ private final class FakeDesktopDriver: DesktopDriving {
             ]
         )
     }
+}
+
+private func fixturePNG(width: Int, height: Int) -> Data {
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+    )!
+    context.setFillColor(CGColor(gray: 0.85, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let image = context.makeImage()!
+    let data = NSMutableData()
+    let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(destination, image, nil)
+    XCTAssertTrue(CGImageDestinationFinalize(destination))
+    return data as Data
+}
+
+private func hasOpaqueBlackPixel(atTopLeft point: PNGPixelPoint, in png: Data) -> Bool {
+    guard let source = CGImageSourceCreateWithData(png as CFData, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+          let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: image.width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+          ),
+          let data = context.data
+    else {
+        return false
+    }
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    let x = Int(point.x)
+    let y = Int(point.y)
+    guard x >= 0, x < image.width, y >= 0, y < image.height else { return false }
+
+    // CGBitmapContext has a bottom-left origin; convert the screenshot's
+    // top-left PNG coordinate before inspecting the known RGBA8 buffer.
+    let offset = (image.height - 1 - y) * image.width * 4 + x * 4
+    let bytes = data.assumingMemoryBound(to: UInt8.self)
+    return bytes[offset] == 0 && bytes[offset + 1] == 0 && bytes[offset + 2] == 0 && bytes[offset + 3] == 255
 }
 
 private final class MemoryReceiptStore: ActionReceiptStoring, @unchecked Sendable {
